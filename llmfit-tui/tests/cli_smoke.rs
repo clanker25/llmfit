@@ -1,0 +1,999 @@
+use assert_cmd::Command;
+use serde_json::Value;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::time::{SystemTime, UNIX_EPOCH};
+
+fn run_json_command(args: &[&str]) -> Value {
+    let output = Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .env_remove("LLAMA_CPP_PATH")
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    serde_json::from_slice(&output).expect("command did not emit valid JSON")
+}
+
+fn run_json_failure(args: &[&str]) -> (i32, Value) {
+    let output = Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .args(args)
+        .output()
+        .expect("failed to run llmfit");
+
+    let code = output
+        .status
+        .code()
+        .expect("process was terminated by a signal");
+    let json = serde_json::from_slice(&output.stdout).expect("command did not emit valid JSON");
+    (code, json)
+}
+
+fn models_array(json: &Value) -> &[Value] {
+    json.get("models")
+        .and_then(Value::as_array)
+        .expect("JSON output missing models array")
+}
+
+fn unique_temp_dir(name: &str) -> PathBuf {
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after Unix epoch")
+        .as_nanos();
+    std::env::temp_dir().join(format!("llmfit-{name}-{}-{nanos}", std::process::id()))
+}
+
+fn create_fake_llama_cpp_bin_dir(name: &str) -> PathBuf {
+    let dir = unique_temp_dir(name);
+    fs::create_dir_all(&dir).expect("failed to create fake llama.cpp bin dir");
+    for binary in ["llama-cli", "llama-server"] {
+        let path = dir.join(binary);
+        fs::write(&path, "#!/bin/sh\nexit 0\n").expect("failed to write fake llama.cpp binary");
+        make_executable(&path);
+    }
+    dir
+}
+
+fn make_executable(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = fs::metadata(path)
+            .expect("failed to stat fake llama.cpp binary")
+            .permissions();
+        permissions.set_mode(0o755);
+        fs::set_permissions(path, permissions)
+            .expect("failed to mark fake llama.cpp binary executable");
+    }
+
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
+#[test]
+fn help_includes_project_description() {
+    let output = Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .arg("--help")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).expect("--help output was not UTF-8");
+    assert!(text.contains("Right-size LLM models to your system's hardware"));
+}
+
+#[test]
+fn version_matches_package_version() {
+    let output = Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .arg("--version")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+
+    let text = String::from_utf8(output).expect("--version output was not UTF-8");
+    assert!(text.contains(env!("CARGO_PKG_VERSION")));
+}
+
+#[test]
+fn plan_autoround_disk_size_uses_all_eight_bit_weights() {
+    let plan = run_json_command(&[
+        "plan",
+        "Minachist/Qwen3.6-35B-A3B-INT8-AutoRound",
+        "--context",
+        "8192",
+        "--json",
+    ]);
+    assert_eq!(plan["quantization"], "AutoRound-8bit");
+    let disk = plan["disk_size_gb"].as_f64().expect("numeric disk size");
+    assert!((disk - 34.1311488).abs() < 1e-9);
+}
+
+#[test]
+fn plan_disk_size_matches_fit_at_the_same_quant() {
+    let info = run_json_command(&[
+        "--no-dashboard",
+        "info",
+        "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+        "--json",
+    ]);
+    let model = &models_array(&info)[0];
+    let quant = model["best_quant"].as_str().expect("selected quant");
+    let plan = run_json_command(&[
+        "--no-dashboard",
+        "plan",
+        "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+        "--context",
+        "8192",
+        "--quant",
+        quant,
+        "--json",
+    ]);
+    let disk = plan["disk_size_gb"].as_f64().expect("numeric disk size");
+    let fit_disk = model["disk_size_gb"].as_f64().expect("fit disk size");
+    assert!(
+        (disk - fit_disk).abs() <= 0.005,
+        "fit JSON rounds to two decimals"
+    );
+    assert_eq!(plan["quantization"], quant);
+
+    let output = Command::cargo_bin("llmfit")
+        .expect("binary")
+        .args([
+            "--no-dashboard",
+            "plan",
+            "Qwen/Qwen2.5-Coder-0.5B-Instruct",
+            "--context",
+            "8192",
+            "--quant",
+            quant,
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    assert!(
+        String::from_utf8(output)
+            .expect("text")
+            .contains("Disk (est):")
+    );
+}
+
+#[test]
+fn system_json_has_expected_shape() {
+    let json = run_json_command(&["--no-dashboard", "--json", "system"]);
+    let system = json
+        .get("system")
+        .and_then(Value::as_object)
+        .expect("system key missing or not an object");
+
+    assert!(system.contains_key("available_ram_gb"));
+    assert!(system.contains_key("cpu_cores"));
+    assert!(system.contains_key("backend"));
+}
+
+fn system_gb(args: &[&str], field: &str) -> Option<f64> {
+    let mut full = vec!["--no-dashboard", "--json"];
+    full.extend_from_slice(args);
+    full.push("system");
+    run_json_command(&full)
+        .get("system")
+        .and_then(|system| system.get(field))
+        .and_then(Value::as_f64)
+}
+
+#[test]
+fn ram_percent_scales_detected_ram() {
+    let detected = system_gb(&[], "total_ram_gb").expect("total_ram_gb missing");
+    let limited =
+        system_gb(&["--ram-percent", "50"], "total_ram_gb").expect("total_ram_gb missing");
+    assert!(
+        (limited - detected / 2.0).abs() < 0.01,
+        "50% of {detected} GB should be {}, got {limited}",
+        detected / 2.0
+    );
+}
+
+#[test]
+fn global_sizing_flags_are_accepted_after_the_subcommand() {
+    for flags in [
+        vec!["--ram", "8G"],
+        vec!["--ram-percent", "50"],
+        vec!["--memory", "8G"],
+        vec!["--cpu-cores", "2"],
+        vec!["--max-context", "4096"],
+        vec!["--profile", "nvidia-rtx-4090"],
+    ] {
+        let mut before = vec!["--no-dashboard", "--json"];
+        before.extend_from_slice(&flags);
+        before.push("system");
+        let mut after = vec!["--no-dashboard", "--json", "system"];
+        after.extend_from_slice(&flags);
+        // Free memory moves between two runs; everything else must match.
+        let system = |args: &[&str]| {
+            let mut system = run_json_command(args)["system"].clone();
+            system
+                .as_object_mut()
+                .expect("system is an object")
+                .remove("available_ram_gb");
+            system
+        };
+        assert_eq!(
+            system(&before),
+            system(&after),
+            "{flags:?} must mean the same before and after the subcommand"
+        );
+    }
+}
+
+#[test]
+fn conflicting_sizing_flags_are_refused_across_the_subcommand() {
+    for (before, after) in [
+        (["--memory", "8G"], ["--memory-percent", "50"]),
+        (["--ram", "8G"], ["--ram-percent", "50"]),
+        (["--profile", "nvidia-rtx-4090"], ["--ram", "8G"]),
+        (["--ram", "8G"], ["--profile", "nvidia-rtx-4090"]),
+    ] {
+        let mut args = vec!["--no-dashboard", "--json"];
+        args.extend_from_slice(&before);
+        args.push("system");
+        args.extend_from_slice(&after);
+        let out = Command::cargo_bin("llmfit")
+            .expect("llmfit binary")
+            .args(&args)
+            .output()
+            .expect("run llmfit");
+        assert_eq!(out.status.code(), Some(2), "{args:?} must be refused");
+    }
+}
+
+#[test]
+fn memory_percent_scales_detected_vram_or_explains_why_it_cannot() {
+    match system_gb(&[], "gpu_vram_gb") {
+        Some(detected) => {
+            let limited =
+                system_gb(&["--memory-percent", "50"], "gpu_vram_gb").expect("gpu_vram_gb missing");
+            assert!((limited - detected / 2.0).abs() < 0.01);
+        }
+        None => {
+            let output = Command::cargo_bin("llmfit")
+                .expect("failed to locate llmfit test binary")
+                .args([
+                    "--no-dashboard",
+                    "--json",
+                    "--memory-percent",
+                    "50",
+                    "system",
+                ])
+                .assert()
+                .failure()
+                .get_output()
+                .stderr
+                .clone();
+            let stderr = String::from_utf8(output).expect("error output was not UTF-8");
+            assert!(stderr.contains("--memory-percent requires detected GPU VRAM"));
+        }
+    }
+}
+
+#[test]
+fn percent_flags_reject_out_of_range_values_and_absolute_counterparts() {
+    for args in [
+        vec!["--memory-percent", "0"],
+        vec!["--memory-percent", "100.5"],
+        vec!["--ram-percent=-10"],
+        vec!["--ram-percent", "abc"],
+        vec!["--memory", "12G", "--memory-percent", "90"],
+        vec!["--ram", "64G", "--ram-percent", "80"],
+    ] {
+        Command::cargo_bin("llmfit")
+            .expect("failed to locate llmfit test binary")
+            .arg("--no-dashboard")
+            .args(&args)
+            .args(["--json", "system"])
+            .assert()
+            .failure();
+    }
+}
+
+#[test]
+fn size_flags_reject_unparseable_values() {
+    for args in [
+        vec!["--memory", "24G."],
+        vec!["--memory", "1e3G"],
+        vec!["--ram", "64x"],
+        vec!["--ram", ""],
+    ] {
+        let output = Command::cargo_bin("llmfit")
+            .expect("failed to locate llmfit test binary")
+            .arg("--no-dashboard")
+            .args(&args)
+            .args(["--json", "system"])
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone();
+        let stderr = String::from_utf8(output).expect("error output was not UTF-8");
+        assert!(
+            stderr.contains("expected a size like 32G"),
+            "{args:?}: unexpected stderr {stderr}"
+        );
+    }
+}
+
+#[test]
+fn llama_cpp_path_flag_rejects_missing_directory() {
+    let missing = unique_temp_dir("missing-llama-cpp-path");
+    let missing_str = missing.to_str().expect("temp dir path was not UTF-8");
+
+    let output = Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .args([
+            "--no-dashboard",
+            "--llama-cpp-path",
+            missing_str,
+            "--json",
+            "system",
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .stderr
+        .clone();
+    let stderr = String::from_utf8(output).expect("error output was not UTF-8");
+    assert_eq!(
+        stderr.trim(),
+        format!(
+            "Error: --llama-cpp-path '{}' does not exist or is not a directory.",
+            missing.display()
+        )
+    );
+}
+
+#[test]
+fn list_json_returns_non_empty_catalog() {
+    let json = run_json_command(&["--no-dashboard", "--json", "list"]);
+    let models = json
+        .as_array()
+        .expect("list --json output should be an array");
+
+    assert!(!models.is_empty(), "model catalog should not be empty");
+    let first = models[0]
+        .as_object()
+        .expect("first model entry should be a JSON object");
+    assert!(first.contains_key("name"));
+    assert!(first.contains_key("provider"));
+}
+
+#[test]
+fn search_json_returns_matching_models() {
+    let json = run_json_command(&["--no-dashboard", "--json", "search", "qwen"]);
+    let models = json
+        .as_array()
+        .expect("search --json output should be an array");
+
+    assert!(!models.is_empty(), "qwen should match catalog models");
+    assert!(models.iter().all(|model| {
+        model
+            .get("name")
+            .and_then(Value::as_str)
+            .is_some_and(|name| name.to_lowercase().contains("qwen"))
+            || model
+                .get("provider")
+                .and_then(Value::as_str)
+                .is_some_and(|provider| provider.to_lowercase().contains("qwen"))
+    }));
+}
+
+#[test]
+fn search_json_matches_every_word_of_a_multi_word_query() {
+    let json = run_json_command(&["--no-dashboard", "--json", "search", "llama 8b"]);
+    let models = json
+        .as_array()
+        .expect("search --json output should be an array");
+
+    assert!(!models.is_empty(), "llama 8b should match catalog models");
+    assert!(models.iter().all(|model| {
+        ["llama", "8b"].iter().all(|word| {
+            ["name", "provider", "parameter_count"].iter().any(|field| {
+                model
+                    .get(*field)
+                    .and_then(Value::as_str)
+                    .is_some_and(|text| text.to_lowercase().contains(word))
+            })
+        })
+    }));
+}
+
+#[test]
+fn search_json_without_local_matches_returns_empty_array() {
+    let json = run_json_command(&["--no-dashboard", "--json", "search", "does-not-exist-xyz"]);
+
+    assert_eq!(json, Value::Array(Vec::new()));
+}
+
+#[test]
+fn fit_json_obeys_limit_and_contains_models_field() {
+    let json = run_json_command(&[
+        "--no-dashboard",
+        "--json",
+        "--memory",
+        "8G",
+        "--ram",
+        "16G",
+        "--cpu-cores",
+        "4",
+        "fit",
+        "--limit",
+        "3",
+    ]);
+
+    let models = json
+        .get("models")
+        .and_then(Value::as_array)
+        .expect("fit --json output missing models array");
+
+    assert!(models.len() <= 3, "fit output exceeded requested limit");
+
+    if let Some(first) = models.first() {
+        let first = first
+            .as_object()
+            .expect("fit model entry should be a JSON object");
+        assert!(first.contains_key("fit_level"));
+        assert!(first.contains_key("run_mode"));
+        assert!(first.contains_key("score"));
+    }
+}
+
+#[test]
+fn fit_provider_filter_accepts_commas_case_insensitively_and_matches_gguf_sources() {
+    let json = run_json_command(&[
+        "--no-dashboard",
+        "--json",
+        "--memory",
+        "8G",
+        "--ram",
+        "16G",
+        "--cpu-cores",
+        "4",
+        "fit",
+        "--providers",
+        "not-a-provider,BaRtOwSkI",
+        "--limit",
+        "3",
+    ]);
+    let models = models_array(&json);
+
+    assert!(
+        !models.is_empty(),
+        "GGUF-source provider should match models"
+    );
+    assert!(
+        models.len() <= 3,
+        "provider filter should apply before the limit"
+    );
+    assert!(models.iter().all(|model| {
+        model
+            .get("provider")
+            .and_then(Value::as_str)
+            .is_some_and(|provider| !provider.eq_ignore_ascii_case("bartowski"))
+    }));
+}
+
+#[test]
+fn recommend_capability_filter_does_not_ignore_unknown_or_tts() {
+    let tts_json = run_json_command(&[
+        "--no-dashboard",
+        "--json",
+        "--memory",
+        "8G",
+        "--ram",
+        "16G",
+        "--cpu-cores",
+        "4",
+        "recommend",
+        "--capability",
+        "tts",
+        "-n",
+        "5",
+    ]);
+    assert!(models_array(&tts_json).iter().all(|model| {
+        model
+            .get("capability_ids")
+            .and_then(Value::as_array)
+            .is_some_and(|caps| caps.iter().any(|cap| cap.as_str() == Some("tts")))
+    }));
+
+    let unknown_json = run_json_command(&[
+        "--no-dashboard",
+        "--json",
+        "--memory",
+        "8G",
+        "--ram",
+        "16G",
+        "--cpu-cores",
+        "4",
+        "recommend",
+        "--capability",
+        "not_a_capability",
+        "-n",
+        "5",
+    ]);
+    assert!(
+        models_array(&unknown_json).is_empty(),
+        "unknown capability should not match every model"
+    );
+}
+
+#[test]
+fn recommend_rejects_unknown_filter_values() {
+    for (flag, value) in [
+        ("--use-case", "not_a_use_case"),
+        ("--min-fit", "not_a_fit"),
+        ("--runtime", "not_a_runtime"),
+    ] {
+        let output = Command::cargo_bin("llmfit")
+            .expect("failed to locate llmfit test binary")
+            .args([
+                "--no-dashboard",
+                "--memory",
+                "8G",
+                "--ram",
+                "16G",
+                "--cpu-cores",
+                "4",
+                "recommend",
+                flag,
+                value,
+            ])
+            .output()
+            .expect("failed to run llmfit");
+
+        assert_eq!(output.status.code(), Some(1), "{flag} {value} should fail");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            stderr.contains(&format!("Unknown {flag} '{value}'")),
+            "unexpected stderr for {flag}: {stderr}"
+        );
+    }
+}
+
+#[test]
+fn fit_json_returns_empty_models_when_no_perfect_matches() {
+    let json = run_json_command(&[
+        "--no-dashboard",
+        "--json",
+        "--memory",
+        "1M",
+        "--ram",
+        "1M",
+        "--cpu-cores",
+        "1",
+        "fit",
+        "--perfect",
+    ]);
+
+    let models = json
+        .get("models")
+        .and_then(Value::as_array)
+        .expect("fit --json output missing models array");
+
+    assert!(
+        models.is_empty(),
+        "expected no perfect matches on extremely constrained hardware"
+    );
+}
+
+#[test]
+fn fit_show_incompatible_includes_non_runnable_models() {
+    let mut args = vec![
+        "--no-dashboard",
+        "--json",
+        "--memory",
+        "8G",
+        "--ram",
+        "16G",
+        "--cpu-cores",
+        "4",
+        "fit",
+    ];
+    let default = run_json_command(&args);
+    args.push("--show-incompatible");
+    let expanded = run_json_command(&args);
+    let db = llmfit_core::models::ModelDatabase::new();
+    let specialized = db
+        .get_all_models()
+        .iter()
+        .find(|model| model.requires_specialized_runtime() && !model.is_sanitization_demoted())
+        .expect("catalog should contain a specialized-runtime model");
+    assert!(
+        models_array(&default)
+            .iter()
+            .all(|model| model["name"] != specialized.name)
+    );
+    let row = models_array(&expanded)
+        .iter()
+        .find(|model| model["name"] == specialized.name)
+        .expect("--show-incompatible should expose the hidden specialized-runtime model");
+    assert_eq!(row["runnable"], false);
+    assert_eq!(row["runtime"], "unsupported");
+    assert_eq!(row["estimated_tps"], 0.0);
+    assert_eq!(row["estimate_confidence"], "unsupported");
+    assert_eq!(row["usable_context"], 0);
+    assert!(row["measured_tps"].is_null());
+    assert!(row["verify_command"].is_null());
+    for model in models_array(&default) {
+        let same = models_array(&expanded)
+            .iter()
+            .find(|row| row["name"] == model["name"]);
+        let same = same.expect("compatible model should remain in the expanded output");
+        // Live RAM bandwidth is measured separately by each invocation, so
+        // throughput and score need not be bit-for-bit equal.
+        for key in [
+            "fit_level",
+            "runtime",
+            "best_quant",
+            "memory_required_gb",
+            "memory_available_gb",
+            "runnable",
+        ] {
+            assert_eq!(same[key], model[key], "compatible model's {key} changed");
+        }
+    }
+    assert!(models_array(&expanded).iter().all(|row| {
+        !db.get_all_models()
+            .iter()
+            .any(|model| model.name == row["name"] && model.is_sanitization_demoted())
+    }));
+    args.push("--perfect");
+    let perfect = run_json_command(&args);
+    assert!(
+        models_array(&perfect)
+            .iter()
+            .all(|row| row["runnable"] == true)
+    );
+}
+
+#[test]
+fn fit_show_incompatible_labels_table_and_csv_rows() {
+    let db = llmfit_core::models::ModelDatabase::new();
+    let model = db
+        .get_all_models()
+        .iter()
+        .find(|model| model.requires_specialized_runtime() && !model.is_sanitization_demoted())
+        .expect("catalog should contain a specialized-runtime model");
+    let args = [
+        "--no-dashboard",
+        "fit",
+        "--show-incompatible",
+        "--providers",
+        model.provider.as_str(),
+    ];
+    let table = Command::cargo_bin("llmfit")
+        .expect("binary")
+        .args(args)
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let text = String::from_utf8(table).expect("UTF-8 table");
+    assert!(text.contains("backend-incompatible (non-runnable)"));
+    assert!(
+        text.lines()
+            .any(|line| line.contains(&model.name) && line.contains("Non-runnable"))
+    );
+
+    let output = Command::cargo_bin("llmfit")
+        .expect("binary")
+        .args(args)
+        .arg("--csv")
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let mut reader = csv::Reader::from_reader(output.as_slice());
+    let headers = reader.headers().expect("CSV headers").clone();
+    let column = |name| {
+        headers
+            .iter()
+            .position(|header| header == name)
+            .expect("CSV column")
+    };
+    let row = reader
+        .records()
+        .map(|record| record.expect("CSV row"))
+        .find(|row| row.get(column("name")) == Some(model.name.as_str()))
+        .expect("incompatible CSV row");
+    assert_eq!(row.get(column("runnable")), Some("false"));
+    assert_eq!(row.get(column("runtime")), Some("unsupported"));
+    assert_eq!(row.get(column("estimated_tps")), Some("0.0"));
+}
+
+#[test]
+fn cpu_cores_parser_rejects_zero() {
+    Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .args(["--cpu-cores", "0", "--json", "system"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn info_json_model_not_found_is_structured_and_fails() {
+    let (code, json) =
+        run_json_failure(&["--no-dashboard", "--json", "info", "does-not-exist-xyz"]);
+
+    assert_eq!(code, 1);
+    assert_eq!(json["error"]["kind"], "model_not_found");
+    assert_eq!(
+        json["error"]["message"],
+        "No model found matching 'does-not-exist-xyz'"
+    );
+}
+
+#[test]
+fn diff_named_models_ignore_the_fit_filter() {
+    // A 405B model is Too Tight on 8 GB, which the default `--fit runnable`
+    // excludes; naming it must still compare it.
+    let json = run_json_command(&[
+        "--no-dashboard",
+        "--memory",
+        "8G",
+        "--json",
+        "diff",
+        "meta-llama/Llama-3.1-405B",
+        "Qwen/Qwen2.5-0.5B",
+    ]);
+
+    let models = json["models"].as_array().expect("models missing");
+    assert_eq!(models.len(), 2);
+    assert_eq!(models[0]["model"]["name"], "meta-llama/Llama-3.1-405B");
+    assert_eq!(models[0]["fit_level"], "TooTight");
+    assert_eq!(models[1]["model"]["name"], "Qwen/Qwen2.5-0.5B");
+}
+
+#[test]
+fn plan_concurrency_claim_json_errors_are_structured_and_fail() {
+    for (args, kind) in [
+        (
+            vec!["plan", "does-not-exist-xyz", "--context", "4096"],
+            "model_not_found",
+        ),
+        (vec!["concurrency", "does-not-exist-xyz"], "model_not_found"),
+        (vec!["claim", "does-not-exist-xyz"], "model_not_found"),
+        (vec!["concurrency", "qwen"], "invalid_selector"),
+        (
+            vec![
+                "plan",
+                "Qwen/Qwen2.5-0.5B",
+                "--context",
+                "4096",
+                "--kv-quant",
+                "nope",
+            ],
+            "plan",
+        ),
+    ] {
+        let mut full = vec!["--no-dashboard", "--json"];
+        full.extend(&args);
+        let (code, json) = run_json_failure(&full);
+
+        assert_eq!(code, 1, "{args:?}");
+        assert_eq!(json["error"]["kind"], kind, "{args:?}");
+        assert!(json["error"]["message"].is_string(), "{args:?}");
+    }
+}
+
+#[test]
+fn diff_json_model_not_found_is_structured_and_fails() {
+    let (code, json) = run_json_failure(&[
+        "--no-dashboard",
+        "--json",
+        "diff",
+        "does-not-exist-xyz",
+        "also-not-real",
+    ]);
+
+    assert_eq!(code, 1);
+    assert_eq!(json["error"]["kind"], "model_not_found");
+    assert_eq!(
+        json["error"]["message"],
+        "No model found matching 'does-not-exist-xyz'"
+    );
+}
+fn llama_cpp_path_flag_makes_provider_available() {
+    let dir = create_fake_llama_cpp_bin_dir("llama-cpp-path");
+    let dir_str = dir.to_str().expect("temp dir path was not UTF-8");
+
+    let json = run_json_command(&[
+        "--no-dashboard",
+        "--llama-cpp-path",
+        dir_str,
+        "--json",
+        "system",
+    ]);
+    let llama_cpp = json
+        .pointer("/providers/llama.cpp")
+        .and_then(Value::as_object)
+        .expect("llama.cpp provider status missing");
+
+    assert_eq!(
+        llama_cpp.get("available").and_then(Value::as_bool),
+        Some(true)
+    );
+    assert_eq!(
+        llama_cpp.get("llama_cli_path").and_then(Value::as_str),
+        Some(
+            dir.join("llama-cli")
+                .to_str()
+                .expect("binary path was not UTF-8")
+        )
+    );
+    assert_eq!(
+        llama_cpp.get("llama_server_path").and_then(Value::as_str),
+        Some(
+            dir.join("llama-server")
+                .to_str()
+                .expect("binary path was not UTF-8")
+        )
+    );
+
+    let _ = fs::remove_dir_all(dir);
+}
+#[test]
+fn llama_cpp_path_flag_overrides_env_var() {
+    let env_dir = create_fake_llama_cpp_bin_dir("llama-cpp-env");
+    let flag_dir = create_fake_llama_cpp_bin_dir("llama-cpp-flag");
+    let flag_dir_str = flag_dir.to_str().expect("temp dir path was not UTF-8");
+
+    let output = Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .env("LLAMA_CPP_PATH", &env_dir)
+        .args([
+            "--no-dashboard",
+            "--llama-cpp-path",
+            flag_dir_str,
+            "--json",
+            "system",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let json: Value = serde_json::from_slice(&output).expect("command did not emit valid JSON");
+    let llama_cpp = json
+        .pointer("/providers/llama.cpp")
+        .and_then(Value::as_object)
+        .expect("llama.cpp provider status missing");
+
+    assert_eq!(
+        llama_cpp.get("llama_cli_path").and_then(Value::as_str),
+        Some(
+            flag_dir
+                .join("llama-cli")
+                .to_str()
+                .expect("binary path was not UTF-8")
+        )
+    );
+
+    let _ = fs::remove_dir_all(env_dir);
+    let _ = fs::remove_dir_all(flag_dir);
+}
+#[test]
+fn llama_cpp_path_flag_works_with_help() {
+    Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .args(["--llama-cpp-path", "/tmp/x", "--help"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn concurrency_users_parser_rejects_zero() {
+    // Regression for PR #999 review: --users must be rejected at the CLI
+    // boundary when zero, not treated as a target that any context satisfies.
+    Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .args(["concurrency", "llama-3.1-8b", "--users", "0"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn concurrency_context_parser_rejects_zero() {
+    // Regression for PR #999 review: --context must be rejected at the CLI
+    // boundary when zero, not emitted as a zero-context ladder row.
+    Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .args(["concurrency", "llama-3.1-8b", "--context", "0"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn concurrency_rejects_unrecognized_quant() {
+    // Greptile P1: an unknown or mis-cased --quant must be rejected, not sized
+    // silently as Q4 with the requested label echoed back.
+    Command::cargo_bin("llmfit")
+        .expect("failed to locate llmfit test binary")
+        .args(["concurrency", "any-model", "--quant", "q8_0"])
+        .assert()
+        .failure();
+}
+
+#[test]
+fn concurrency_honors_global_context_cap() {
+    // Greptile P1: --max-context must clamp the concurrency ladder, not only the
+    // preliminary fit analysis.
+    let v = run_json_command(&[
+        "--memory",
+        "24",
+        "--max-context",
+        "8192",
+        "concurrency",
+        "Qwen/Qwen3-8B",
+        "--json",
+    ]);
+    let ladder = v["estimate"]["ladder"]
+        .as_array()
+        .expect("JSON output missing estimate.ladder");
+    assert!(!ladder.is_empty());
+    for slot in ladder {
+        let eff = slot["effective_context"]
+            .as_u64()
+            .expect("effective_context");
+        assert!(
+            eff <= 8192,
+            "ladder reports context {eff} above the 8192 cap"
+        );
+    }
+    // Requested values are preserved and over-cap rungs are marked clamped, so
+    // the cap does not corrupt the structured requested-vs-effective metadata.
+    assert!(
+        ladder
+            .iter()
+            .any(|s| s["requested_context"].as_u64().unwrap_or(0) > 8192
+                && s["clamped"].as_bool().unwrap_or(false)),
+        "expected an over-cap rung kept as requested and marked clamped"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn list_into_a_closed_pipe_exits_without_a_panic() {
+    use std::io::{BufRead, BufReader};
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::Stdio;
+
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_llmfit"))
+        .arg("list")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("failed to start llmfit");
+    let mut first = String::new();
+    BufReader::new(child.stdout.take().unwrap())
+        .read_line(&mut first)
+        .expect("failed to read the first line");
+    // The reader is dropped here, like `head -1` exiting.
+    let output = child.wait_with_output().expect("failed to wait for llmfit");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("panicked"), "llmfit panicked: {stderr}");
+    assert_eq!(output.status.signal(), Some(libc::SIGPIPE));
+}

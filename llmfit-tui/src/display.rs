@@ -1,0 +1,1481 @@
+use std::path::PathBuf;
+use std::sync::OnceLock;
+
+use colored::*;
+use llmfit_core::fit::{FitLevel, InferenceRuntime, ModelFit, RunMode, SortColumn};
+use llmfit_core::hardware::SystemSpecs;
+use llmfit_core::models::LlmModel;
+use llmfit_core::plan::PlanEstimate;
+use llmfit_core::providers::LlamaCppBinaryStyle;
+use llmfit_core::storage::{StorageEstimate, StorageSelection};
+use tabled::{Table, Tabled, settings::Style};
+
+#[derive(Tabled)]
+struct ModelRow {
+    #[tabled(rename = "Status")]
+    status: String,
+    #[tabled(rename = "Model")]
+    name: String,
+    #[tabled(rename = "Provider")]
+    provider: String,
+    #[tabled(rename = "Size")]
+    size: String,
+    #[tabled(rename = "Score")]
+    score: String,
+    #[tabled(rename = "tok/s est.")]
+    tps: String,
+    #[tabled(rename = "Quant")]
+    quant: String,
+    #[tabled(rename = "Conf")]
+    confidence: String,
+    #[tabled(rename = "Runtime")]
+    runtime: String,
+    #[tabled(rename = "Mode")]
+    mode: String,
+    #[tabled(rename = "Mem %")]
+    mem_use: String,
+    #[tabled(rename = "Context")]
+    context: String,
+    #[tabled(rename = "Added to HF")]
+    release_date: String,
+}
+
+/// Confidence cell for the fit table.
+///
+/// The table uses the short code so the column stays narrow on an 80-column
+/// terminal; the full label lives in the detail view below (issue #974).
+/// Derived rather than read from `fit.estimate_confidence`, which is stale
+/// unless its writer called `refresh_estimate_confidence` (issue #969).
+fn confidence_cell(fit: &ModelFit) -> &'static str {
+    fit.effective_estimate_confidence().short_label()
+}
+
+pub fn display_all_models(models: &[LlmModel], sort: SortColumn) {
+    let mut models: Vec<&LlmModel> = models.iter().collect();
+    match sort {
+        SortColumn::ReleaseDate => {
+            models.sort_by(|a, b| {
+                b.release_date
+                    .as_deref()
+                    .unwrap_or("")
+                    .cmp(a.release_date.as_deref().unwrap_or(""))
+            });
+        }
+        SortColumn::Params => {
+            models.sort_by(|a, b| {
+                b.parameters_raw
+                    .unwrap_or(0)
+                    .cmp(&a.parameters_raw.unwrap_or(0))
+            });
+        }
+        SortColumn::Ctx => {
+            models.sort_by(|a, b| b.context_length.cmp(&a.context_length));
+        }
+        SortColumn::MemPct => {
+            models.sort_by(|a, b| {
+                let a_mem = a.min_vram_gb.unwrap_or(a.min_ram_gb);
+                let b_mem = b.min_vram_gb.unwrap_or(b.min_ram_gb);
+                b_mem
+                    .partial_cmp(&a_mem)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        _ => {}
+    }
+    println!("\n{}", "=== Available LLM Models ===".bold().cyan());
+    println!(
+        "Total models: {} (sorted by: {})\n",
+        models.len(),
+        sort.label()
+    );
+
+    let rows: Vec<ModelRow> = models
+        .iter()
+        .map(|m| ModelRow {
+            status: "--".to_string(),
+            name: m.name.clone(),
+            provider: m.provider.clone(),
+            size: m.parameter_count.clone(),
+            score: "-".to_string(),
+            tps: "-".to_string(),
+            quant: m.quantization.clone(),
+            confidence: "-".to_string(),
+            runtime: "-".to_string(),
+            mode: "-".to_string(),
+            mem_use: "-".to_string(),
+            context: format!("{}k", m.context_length / 1000),
+            release_date: m
+                .release_date
+                .clone()
+                .unwrap_or_else(|| "\u{2014}".to_string()),
+        })
+        .collect();
+
+    let table = Table::new(rows).with(Style::rounded()).to_string();
+    println!("{}", table);
+}
+
+pub fn display_model_fits(fits: &[ModelFit]) {
+    if fits.is_empty() {
+        println!(
+            "\n{}",
+            "No compatible models found for your system.".yellow()
+        );
+        return;
+    }
+
+    println!("\n{}", "=== Model Compatibility Analysis ===".bold().cyan());
+    let incompatible = fits
+        .iter()
+        .filter(|fit| fit.runtime == InferenceRuntime::Unsupported)
+        .count();
+    if incompatible > 0 {
+        println!(
+            "Found {} model(s), including {incompatible} backend-incompatible (non-runnable)\n",
+            fits.len()
+        );
+    } else {
+        println!("Found {} compatible model(s)\n", fits.len());
+    }
+
+    let rows: Vec<ModelRow> = fits
+        .iter()
+        .map(|fit| {
+            let status_prefix = if fit.installed { "✓ " } else { "" };
+            let unsupported = fit.runtime == InferenceRuntime::Unsupported;
+            let label = if unsupported {
+                "Non-runnable"
+            } else {
+                fit.fit_text()
+            };
+            let status_text = format!("{}{} {}", status_prefix, fit.fit_emoji(), label);
+
+            ModelRow {
+                status: status_text,
+                name: fit.model.name.clone(),
+                provider: fit.model.provider.clone(),
+                size: fit.model.parameter_count.clone(),
+                score: format!("{:.0}", fit.score),
+                tps: match &fit.measured_tps {
+                    Some(m) => format!("{:.1} ✓", m.tok_s),
+                    None => format!("{:.1}", fit.estimated_tps),
+                },
+                quant: display_best_quant(fit).to_string(),
+                confidence: confidence_cell(fit).to_string(),
+                runtime: fit.runtime_text().to_string(),
+                mode: if unsupported {
+                    "-".to_string()
+                } else {
+                    fit.run_mode_text().to_string()
+                },
+                mem_use: format!("{:.1}%", fit.utilization_pct),
+                context: fit.context_display(),
+                release_date: fit
+                    .model
+                    .release_date
+                    .clone()
+                    .unwrap_or_else(|| "\u{2014}".to_string()),
+            }
+        })
+        .collect();
+
+    let table = Table::new(rows).with(Style::rounded()).to_string();
+    println!("{}", table);
+    println!(
+        "  Note: tok/s values are baseline estimates; real runtime depends on engine/runtime."
+    );
+    if fits.iter().any(|f| f.measured_tps.is_some()) {
+        println!(
+            "  ✓ = measured, not estimated: your own benchmarks, llmfit community submissions \
+             with matching CPU/GPU, or localmaxxing.com data for matching hardware."
+        );
+    }
+}
+
+pub fn display_model_detail(fit: &ModelFit) {
+    println!("\n{}", format!("=== {} ===", fit.model.name).bold().cyan());
+    println!();
+    println!("{}: {}", "Provider".bold(), fit.model.provider);
+    println!("{}: {}", "Parameters".bold(), fit.model.parameter_count);
+    println!("{}: {}", "Quantization".bold(), fit.model.quantization);
+    println!("{}: {}", "Best Quant".bold(), display_best_quant(fit));
+    println!(
+        "{}: {} tokens",
+        "Context Length".bold(),
+        fit.model.context_length
+    );
+    println!("{}: {}", "Use Case".bold(), fit.model.use_case);
+    println!("{}: {}", "Category".bold(), fit.use_case.label());
+    if let Some(ref date) = fit.model.release_date {
+        println!("{}: {}", "Released".bold(), date);
+    }
+    println!(
+        "{}: {}",
+        "License".bold(),
+        fit.model.license.as_deref().unwrap_or("Unknown")
+    );
+    println!(
+        "{}: {} (baseline est. ~{:.1} tok/s)",
+        "Runtime".bold(),
+        fit.runtime_text(),
+        fit.estimated_tps
+    );
+    println!();
+
+    println!("{}", "Score Breakdown:".bold().underline());
+    println!("  Overall Score: {:.1} / 100", fit.score);
+    println!(
+        "  Quality: {:.0}  Speed: {:.0}  Fit: {:.0}  Context: {:.0}",
+        fit.score_components.quality,
+        fit.score_components.speed,
+        fit.score_components.fit,
+        fit.score_components.context
+    );
+    println!("  Baseline Est. Speed: {:.1} tok/s", fit.estimated_tps);
+    println!();
+
+    display_estimate_basis(fit);
+
+    println!("{}", "Resource Requirements:".bold().underline());
+    if let Some(vram) = fit.model.min_vram_gb {
+        println!("  Min VRAM: {:.1} GB", vram);
+    }
+    println!("  Min RAM: {:.1} GB (CPU inference)", fit.model.min_ram_gb);
+    println!("  Recommended RAM: {:.1} GB", fit.model.recommended_ram_gb);
+    println!(
+        "  Disk (est): {:.1} GB (at {})",
+        fit.model.estimate_disk_gb(&fit.best_quant),
+        display_best_quant(fit)
+    );
+    let quants: &[&str] = if fit.best_quant.starts_with("mlx") {
+        &["mlx-8bit", "mlx-4bit"]
+    } else {
+        &["Q8_0", "Q6_K", "Q5_K_M", "Q4_K_M", "Q3_K_M", "Q2_K"]
+    };
+    let breakdown: Vec<String> = quants
+        .iter()
+        .map(|q| format!("{}: {:.1}G", q, fit.model.estimate_disk_gb(q)))
+        .collect();
+    println!("  Disk/quant: {}", breakdown.join("  "));
+
+    // MoE Architecture info
+    if fit.model.is_moe {
+        println!();
+        println!("{}", "MoE Architecture:".bold().underline());
+        if let (Some(num_experts), Some(active_experts)) =
+            (fit.model.num_experts, fit.model.active_experts)
+        {
+            println!(
+                "  Experts: {} active / {} total per token",
+                active_experts, num_experts
+            );
+        }
+        if let Some(active_vram) = fit.model.moe_active_vram_gb() {
+            println!(
+                "  Active VRAM: {:.1} GB (vs {:.1} GB full model)",
+                active_vram,
+                fit.model.min_vram_gb.unwrap_or(0.0)
+            );
+        }
+        if let Some(offloaded) = fit.moe_offloaded_gb {
+            println!("  Offloaded: {:.1} GB inactive experts in RAM", offloaded);
+        }
+    }
+    println!();
+
+    println!("{}", "Fit Analysis:".bold().underline());
+
+    let fit_color = match fit.fit_level {
+        FitLevel::Perfect => "green",
+        FitLevel::Good => "yellow",
+        FitLevel::Marginal => "orange",
+        FitLevel::TooTight => "red",
+    };
+
+    println!(
+        "  Status: {} {}",
+        fit.fit_emoji(),
+        fit.fit_text().color(fit_color)
+    );
+    println!("  Run Mode: {}", fit.run_mode_text());
+    println!(
+        "  Memory Utilization: {:.1}% ({:.1} / {:.1} GB)",
+        fit.utilization_pct, fit.memory_required_gb, fit.memory_available_gb
+    );
+    println!();
+
+    if !fit.model.gguf_sources.is_empty() {
+        println!("{}", "GGUF Downloads:".bold().underline());
+        for src in &fit.model.gguf_sources {
+            println!("  {} → https://huggingface.co/{}", src.provider, src.repo);
+        }
+        println!(
+            "  {}",
+            format!(
+                "Tip: llmfit download {} --quant {}",
+                fit.model.gguf_sources[0].repo, fit.best_quant
+            )
+            .dimmed()
+        );
+        println!();
+    }
+
+    let mut notes: Vec<String> = fit.notes.clone();
+    if let Some(note) = crate::serve_shared::best_quant_mismatch_note(fit) {
+        notes.push(note);
+    }
+    if !notes.is_empty() {
+        println!("{}", "Notes:".bold().underline());
+        for note in &notes {
+            println!("  {}", note);
+        }
+        println!();
+    }
+}
+
+pub fn display_model_diff(fits: &[ModelFit], sort_label: &str) {
+    if fits.len() < 2 {
+        println!("\n{}", "Need at least 2 models to compare.".yellow());
+        return;
+    }
+
+    println!("\n{}", "=== Model Diff ===".bold().cyan());
+    println!(
+        "Comparing {} model(s) (sorted by {})\n",
+        fits.len(),
+        sort_label
+    );
+
+    let metric_width = 20usize;
+    let col_width = 32usize;
+
+    let model_headers: Vec<String> = fits
+        .iter()
+        .enumerate()
+        .map(|(i, fit)| {
+            let label = format!("M{}: {}", i + 1, fit.model.name);
+            truncate_to_width(&label, col_width)
+        })
+        .collect();
+
+    print!("{:<metric_width$}", "Metric".bold());
+    for header in &model_headers {
+        print!("  {:<col_width$}", header.bold());
+    }
+    println!();
+
+    print!("{:-<metric_width$}", "");
+    for _ in &model_headers {
+        print!("  {:-<col_width$}", "");
+    }
+    println!();
+
+    let base = &fits[0];
+
+    print_metric_row(
+        "Score",
+        fits.iter()
+            .map(|f| format_with_delta(format!("{:.1}", f.score), f.score - base.score))
+            .collect(),
+        metric_width,
+        col_width,
+    );
+    print_metric_row(
+        "Baseline tok/s",
+        fits.iter()
+            .map(|f| {
+                format_with_delta(
+                    format!("{:.1}", f.estimated_tps),
+                    f.estimated_tps - base.estimated_tps,
+                )
+            })
+            .collect(),
+        metric_width,
+        col_width,
+    );
+    print_metric_row(
+        "Fit",
+        fits.iter()
+            .map(|f| format!("{} {}", f.fit_emoji(), f.fit_text()))
+            .collect(),
+        metric_width,
+        col_width,
+    );
+    print_metric_row(
+        "Run Mode",
+        fits.iter().map(|f| f.run_mode_text().to_string()).collect(),
+        metric_width,
+        col_width,
+    );
+    print_metric_row(
+        "Runtime",
+        fits.iter().map(|f| f.runtime_text().to_string()).collect(),
+        metric_width,
+        col_width,
+    );
+    print_metric_row(
+        "Memory %",
+        fits.iter()
+            .map(|f| {
+                format_with_delta(
+                    format!("{:.1}%", f.utilization_pct),
+                    f.utilization_pct - base.utilization_pct,
+                )
+            })
+            .collect(),
+        metric_width,
+        col_width,
+    );
+    print_metric_row(
+        "Params",
+        fits.iter()
+            .map(|f| f.model.parameter_count.clone())
+            .collect(),
+        metric_width,
+        col_width,
+    );
+    print_metric_row(
+        "Context",
+        fits.iter()
+            .map(|f| format!("{} tokens", f.model.context_length))
+            .collect(),
+        metric_width,
+        col_width,
+    );
+    print_metric_row(
+        "Best Quant",
+        fits.iter().map(|f| f.best_quant.clone()).collect(),
+        metric_width,
+        col_width,
+    );
+    print_metric_row(
+        "Provider",
+        fits.iter().map(|f| f.model.provider.clone()).collect(),
+        metric_width,
+        col_width,
+    );
+}
+
+fn print_metric_row(metric: &str, values: Vec<String>, metric_width: usize, col_width: usize) {
+    print!("{:<metric_width$}", metric);
+    for value in values {
+        print!("  {:<col_width$}", truncate_to_width(&value, col_width));
+    }
+    println!();
+}
+
+fn format_with_delta(value: String, delta: f64) -> String {
+    if delta.abs() < 0.05 {
+        return value;
+    }
+    format!("{} ({:+.1})", value, delta)
+}
+
+fn truncate_to_width(input: &str, width: usize) -> String {
+    if input.chars().count() <= width {
+        return input.to_string();
+    }
+    let mut out = input
+        .chars()
+        .take(width.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
+}
+
+pub fn display_search_results(models: &[&LlmModel], query: &str) {
+    if models.is_empty() {
+        println!(
+            "\n{}",
+            format!("No models found matching '{}'", query).yellow()
+        );
+        return;
+    }
+
+    println!(
+        "\n{}",
+        format!("=== Search Results for '{}' ===", query)
+            .bold()
+            .cyan()
+    );
+    println!("Found {} model(s)\n", models.len());
+
+    let rows: Vec<ModelRow> = models
+        .iter()
+        .map(|m| ModelRow {
+            status: "--".to_string(),
+            name: m.name.clone(),
+            provider: m.provider.clone(),
+            size: m.parameter_count.clone(),
+            score: "-".to_string(),
+            tps: "-".to_string(),
+            quant: m.quantization.clone(),
+            confidence: "-".to_string(),
+            runtime: "-".to_string(),
+            mode: "-".to_string(),
+            mem_use: "-".to_string(),
+            context: format!("{}k", m.context_length / 1000),
+            release_date: m
+                .release_date
+                .clone()
+                .unwrap_or_else(|| "\u{2014}".to_string()),
+        })
+        .collect();
+
+    let table = Table::new(rows).with(Style::rounded()).to_string();
+    println!("{}", table);
+}
+
+// ────────────────────────────────────────────────────────────────────
+// JSON output for machine consumption (OpenClaw skills, scripts, etc.)
+// ────────────────────────────────────────────────────────────────────
+
+/// Serialize system specs to JSON and print to stdout.
+pub fn display_json_system(specs: &SystemSpecs) {
+    let output = serde_json::json!({
+        "system": system_json(specs),
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).expect("JSON serialization failed")
+    );
+}
+
+/// Serialize system specs + model fits to JSON and print to stdout.
+pub fn display_json_fits(specs: &SystemSpecs, fits: &[ModelFit]) {
+    let models: Vec<serde_json::Value> = fits
+        .iter()
+        .map(|fit| fit_to_json_for_specs(fit, specs))
+        .collect();
+    let output = serde_json::json!({
+        "system": system_json(specs),
+        "models": models,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).expect("JSON serialization failed")
+    );
+}
+
+/// Serialize a CLI error for machine consumers.
+pub fn display_json_error(kind: &str, message: &str) {
+    let output = serde_json::json!({
+        "error": {
+            "kind": kind,
+            "message": message,
+        },
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).expect("JSON serialization failed")
+    );
+}
+
+/// Serialize system specs + model fits to JSON with llama.cpp commands and print to stdout.
+pub fn display_json_fits_with_llamacpp(specs: &SystemSpecs, fits: &[ModelFit]) {
+    use llmfit_core::fit::InferenceRuntime;
+
+    let models: Vec<serde_json::Value> = fits
+        .iter()
+        .map(|fit| {
+            let mut json = fit_to_json_for_specs(fit, specs);
+
+            // Add suggested llama.cpp command for llama.cpp-compatible models
+            if fit.runtime == InferenceRuntime::LlamaCpp
+                && let Some(cmd) = generate_llamacpp_command(fit)
+            {
+                json.as_object_mut().unwrap().insert(
+                    "llamacpp_command".to_string(),
+                    serde_json::Value::String(cmd),
+                );
+            }
+
+            json
+        })
+        .collect();
+
+    let output = serde_json::json!({
+        "system": system_json(specs),
+        "models": models,
+    });
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).expect("JSON serialization failed")
+    );
+}
+
+/// Print how the tok/s estimate was derived and how to verify it locally.
+/// Reproducibility ask from issue #292: no number without its inputs.
+fn display_estimate_basis(fit: &ModelFit) {
+    let basis = &fit.estimate_basis;
+
+    if let Some(m) = &fit.measured_tps {
+        match m.source {
+            llmfit_core::benchmarks::MeasuredSource::LocalBench => {
+                println!("{}", "Local Benchmark:".bold().underline());
+                println!(
+                    "  {:.1} tok/s from your own `llmfit bench` run(s) ({} stored)",
+                    m.tok_s, m.sample_count
+                );
+                println!("  Your measurement — trust this over the formula estimate below.");
+            }
+            llmfit_core::benchmarks::MeasuredSource::CommunityLlmfit => {
+                println!("{}", "Community Benchmark:".bold().underline());
+                println!(
+                    "  {:.1} tok/s median across {} llmfit community submission(s) \
+                     (`llmfit bench --share`)",
+                    m.tok_s, m.sample_count
+                );
+                println!("  Real runs with matching CPU and GPU names.");
+            }
+            llmfit_core::benchmarks::MeasuredSource::Community => {
+                println!("{}", "Measured on Matching Hardware:".bold().underline());
+                println!(
+                    "  {:.1} tok/s median across {} community run(s) on {} (localmaxxing.com)",
+                    m.tok_s, m.sample_count, m.hardware_label
+                );
+                println!("  Real user data — trust this over the formula estimate below.");
+            }
+        }
+        if let Some(grade) = m.match_grade {
+            println!("  PCIe match: {}", grade.label());
+        }
+        println!();
+    }
+
+    println!("{}", "Estimate Basis:".bold().underline());
+    println!(
+        "  Confidence: {}",
+        fit.effective_estimate_confidence().label()
+    );
+
+    if basis.method == "unsupported" || fit.estimated_tps <= 0.0 {
+        println!();
+        return;
+    }
+
+    if let Some(c) = basis.local_calibration {
+        println!(
+            "  Calibrated x{:.2} from benchmark run(s) on this exact hardware \
+             (yours and/or the llmfit community's)",
+            c
+        );
+    }
+    match basis.method.as_str() {
+        "gpu_bandwidth_roofline" => {
+            let bw = basis.gpu_bandwidth_gbps.unwrap_or(0.0);
+            println!(
+                "  Method: GPU bandwidth roofline — {:.0} GB/s x {:.2} efficiency",
+                bw, basis.efficiency
+            );
+            if let Some(ddr) = basis.ddr_bandwidth_gbps {
+                println!(
+                    "  MoE offload: expert streaming bounded by ~{:.0} GB/s system RAM bandwidth",
+                    ddr
+                );
+            }
+        }
+        "gpu_ddr_offload_roofline" => {
+            let bw = basis.gpu_bandwidth_gbps.unwrap_or(0.0);
+            let ddr = basis.ddr_bandwidth_gbps.unwrap_or(0.0);
+            println!(
+                "  Method: GPU/RAM offload roofline — {:.0} GB/s GPU x {:.2} efficiency, \
+                 {:.0} GB/s system RAM",
+                bw, basis.efficiency, ddr
+            );
+        }
+        "cpu_constant" => {
+            println!("  Method: CPU heuristic constant (no GPU acceleration assumed)");
+        }
+        _ => {
+            println!("  Method: per-backend heuristic constant — GPU not in the bandwidth table,");
+            println!("          so expect a wide error band. Please report your GPU model so we");
+            println!(
+                "          can add real bandwidth data (github.com/AlexsJones/llmfit/issues)."
+            );
+        }
+    }
+    println!(
+        "  Models single-request generation at ctx <= {} tokens.",
+        basis.assumed_context
+    );
+    match (fit.prefill_tps, fit.ttft_ms) {
+        (Some(prefill), Some(ttft)) => {
+            println!(
+                "  Prefill (est.): ~{:.0} tok/s -> ~{:.0} ms time-to-first-token at {} prompt tokens",
+                prefill, ttft, fit.effective_context_length
+            );
+        }
+        _ => {
+            println!(
+                "  Prompt processing (prefill/TTFT) is not estimated for this model/hardware."
+            );
+        }
+    }
+    println!("  Baseline error band is roughly +/-30%.");
+    println!("{}", "  Verify on this machine:".bold());
+    println!(
+        "    llmfit bench \"{}\"    (against a running provider)",
+        fit.model.name
+    );
+    if let Some(bench_cmd) = crate::serve_shared::generate_llamabench_command(fit) {
+        println!(
+            "    {}    (compare the tg128 row; get the path via `llmfit download`)",
+            bench_cmd
+        );
+    }
+    println!();
+}
+
+/// Generate a llama.cpp command string for a model fit.
+fn generate_llamacpp_command(fit: &ModelFit) -> Option<String> {
+    if fit.run_mode == RunMode::TensorParallel {
+        return None;
+    }
+
+    // Get the GGUF source repo if available
+    let repo = fit.model.gguf_sources.first().map(|s| &s.repo);
+
+    let quant = &fit.best_quant;
+    let context = fit.effective_context_length;
+    let ngl_args = llamacpp_ngl_args(fit.run_mode)?;
+    let conversation_arg = if should_use_llamacpp_conversation_mode(fit) {
+        " -cnv"
+    } else {
+        ""
+    };
+
+    // Use the -hf option with HuggingFace repo to let llama.cpp handle model
+    // downloading/caching. This avoids path guessing issues and works for both
+    // installed and non-installed models. llama.cpp automatically downloads
+    // to its own cache if the model isn't present locally.
+    let prefix = llamacpp_cli_invocation().1.cli_command();
+    repo.map(|repo| {
+        format!(
+            "{} -hf {}:{} {} -c {}{}",
+            prefix, repo, quant, ngl_args, context, conversation_arg
+        )
+    })
+}
+
+fn llamacpp_ngl_args(run_mode: RunMode) -> Option<&'static str> {
+    match run_mode {
+        RunMode::CpuOffload | RunMode::MoeOffload => {
+            llamacpp_ngl_args_for_support(run_mode, llamacpp_supports_fit_arg())
+        }
+        _ => llamacpp_ngl_args_for_support(run_mode, false),
+    }
+}
+
+fn llamacpp_ngl_args_for_support(
+    run_mode: RunMode,
+    supports_fit_arg: bool,
+) -> Option<&'static str> {
+    match run_mode {
+        RunMode::Gpu => Some("-ngl all"),
+        RunMode::CpuOnly => Some("-ngl 0"),
+        RunMode::CpuOffload => Some(if supports_fit_arg {
+            "-ngl auto --fit on"
+        } else {
+            "-ngl auto"
+        }),
+        // llmfit's MoE estimate is not an exact llama.cpp layer/MoE split, so
+        // prefer llama.cpp's fit-aware auto offload rather than forcing --cpu-moe.
+        RunMode::MoeOffload => Some(if supports_fit_arg {
+            "-ngl auto --fit on"
+        } else {
+            "-ngl auto"
+        }),
+        RunMode::TensorParallel => None,
+    }
+}
+
+fn llamacpp_supports_fit_arg() -> bool {
+    static SUPPORTS_FIT_ARG: OnceLock<bool> = OnceLock::new();
+
+    *SUPPORTS_FIT_ARG.get_or_init(|| {
+        let (binary, style) = llamacpp_cli_invocation();
+        let Ok(output) = std::process::Command::new(binary)
+            .args(style.cli_args())
+            .arg("--help")
+            .output()
+        else {
+            return false;
+        };
+
+        String::from_utf8_lossy(&output.stdout).contains("--fit")
+            || String::from_utf8_lossy(&output.stderr).contains("--fit")
+    })
+}
+
+/// The detected llama.cpp CLI binary and how to invoke it (`llama cli` vs
+/// the classic `llama-cli`). Falls back to a bare `llama-cli` name on PATH
+/// when nothing was detected, matching the previous probing behavior.
+fn llamacpp_cli_invocation() -> &'static (PathBuf, LlamaCppBinaryStyle) {
+    static INVOCATION: OnceLock<(PathBuf, LlamaCppBinaryStyle)> = OnceLock::new();
+    INVOCATION.get_or_init(|| {
+        // Binary detection only: constructing a full `LlamaCppProvider` would
+        // also probe for a running llama-server over HTTP.
+        let (cli, _, style) = llmfit_core::providers::detect_llamacpp_binaries();
+        let binary = cli
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from(format!("llama-cli{}", std::env::consts::EXE_SUFFIX)));
+        (binary, style)
+    })
+}
+
+/// Best-effort heuristic: checks use_case and name substrings to guess whether
+/// a model is conversational. May misfire on edge cases (e.g. an embedding model
+/// named "multichat", or a general-purpose model named "functionary").
+fn should_use_llamacpp_conversation_mode(fit: &ModelFit) -> bool {
+    use llmfit_core::models::{Capability, UseCase};
+
+    let name = fit.model.name.to_lowercase();
+    let use_case = fit.model.use_case.to_lowercase();
+
+    if fit.use_case == UseCase::Embedding
+        || use_case.contains("embedding")
+        || name.contains("embed")
+        || name.contains("bge")
+    {
+        return false;
+    }
+
+    fit.use_case == UseCase::Chat
+        || fit.model.capabilities.contains(&Capability::ToolUse)
+        || use_case.contains("chat")
+        || use_case.contains("instruct")
+        || use_case.contains("instruction")
+        || use_case.contains("tool")
+        || use_case.contains("function")
+        || name.contains("chat")
+        || name.contains("instruct")
+        || name.contains("-it")
+}
+
+/// Serialize diff output via serde derives (new diff-only path).
+pub fn display_json_diff_fits(specs: &SystemSpecs, fits: &[ModelFit]) {
+    #[derive(serde::Serialize)]
+    struct FitsOutput<'a> {
+        system: &'a SystemSpecs,
+        models: &'a [ModelFit],
+    }
+    let output = FitsOutput {
+        system: specs,
+        models: fits,
+    };
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&output).expect("JSON serialization failed")
+    );
+}
+
+fn system_json(specs: &SystemSpecs) -> serde_json::Value {
+    crate::serve_shared::system_json(specs)
+}
+
+/// `fit.best_quant` for CLI display, cleared to an em dash when it's a
+/// GGUF-style label that doesn't apply to a native NVFP4/MXFP4-named repo
+/// (issue #969, problem 3). Mirrors `serve_shared::sanitized_best_quant`,
+/// the JSON-facing version of the same check.
+fn display_best_quant(fit: &ModelFit) -> &str {
+    crate::serve_shared::sanitized_best_quant(fit).unwrap_or("\u{2014}")
+}
+
+/// CLI `fit --json` envelope: the shared serializer plus this frontend's legacy
+/// overlays. The overlaid keys carry human-readable strings the API/MCP side
+/// expresses as machine codes (with the human string under a `*_label` key);
+/// the CLI's overloaded values are load-bearing for existing scripts, so they
+/// stay put here until a future PR deprecates them (see #759).
+fn fit_to_json(fit: &ModelFit) -> serde_json::Value {
+    let mut value = crate::serve_shared::fit_to_json(fit);
+    let obj = value
+        .as_object_mut()
+        .expect("fit_to_json returns an object");
+    obj.insert("fit_level".to_string(), serde_json::json!(fit.fit_text()));
+    obj.insert(
+        "run_mode".to_string(),
+        serde_json::json!(fit.run_mode_text()),
+    );
+    obj.insert("runtime".to_string(), serde_json::json!(fit.runtime_text()));
+    obj.insert(
+        "capabilities".to_string(),
+        serde_json::json!(
+            fit.model
+                .capabilities
+                .iter()
+                .map(|c| c.label())
+                .collect::<Vec<_>>()
+        ),
+    );
+    value
+}
+
+fn round1(v: f64) -> f64 {
+    (v * 10.0).round() / 10.0
+}
+
+fn fit_to_json_for_specs(fit: &ModelFit, specs: &SystemSpecs) -> serde_json::Value {
+    let mut value = fit_to_json(fit);
+    value["runnable"] = serde_json::json!(
+        llmfit_core::fit::backend_compatible(&fit.model, specs)
+            && fit.fit_level != FitLevel::TooTight
+            && fit.runtime != InferenceRuntime::Unsupported
+    );
+    value
+}
+
+fn round2(v: f64) -> f64 {
+    (v * 100.0).round() / 100.0
+}
+
+pub fn display_model_plan(plan: &PlanEstimate) {
+    println!("\n{}", "=== Hardware Planning Estimate ===".bold().cyan());
+    println!("{} {}", "Model:".bold(), plan.model_name);
+    println!("{} {}", "Provider:".bold(), plan.provider);
+    println!("{} {}", "Context:".bold(), plan.context);
+    println!("{} {}", "Quantization:".bold(), plan.quantization);
+    println!(
+        "{} {:.2} GB (weights only)",
+        "Disk (est):".bold(),
+        plan.disk_size_gb
+    );
+    println!("{} {}", "KV cache:".bold(), plan.kv_quant.label());
+    if let Some(tps) = plan.target_tps {
+        println!("{} {:.1} tok/s", "Target TPS:".bold(), tps);
+    }
+    println!("{} {}", "Note:".bold(), plan.estimate_notice);
+    println!();
+
+    println!("{}", "Minimum Hardware:".bold().underline());
+    println!(
+        "  VRAM: {}",
+        plan.minimum
+            .vram_gb
+            .map(|v| format!("{v:.1} GB"))
+            .unwrap_or_else(|| "Not required".to_string())
+    );
+    println!("  RAM: {:.1} GB", plan.minimum.ram_gb);
+    println!("  CPU Cores: {}", plan.minimum.cpu_cores);
+    println!();
+
+    println!("{}", "Recommended Hardware:".bold().underline());
+    println!(
+        "  VRAM: {}",
+        plan.recommended
+            .vram_gb
+            .map(|v| format!("{v:.1} GB"))
+            .unwrap_or_else(|| "Not required".to_string())
+    );
+    println!("  RAM: {:.1} GB", plan.recommended.ram_gb);
+    println!("  CPU Cores: {}", plan.recommended.cpu_cores);
+    println!();
+
+    println!("{}", "Feasible Run Paths:".bold().underline());
+    for path in &plan.run_paths {
+        println!(
+            "  {}: {}",
+            path.path.label(),
+            if path.feasible { "Yes" } else { "No" }
+        );
+        if let Some(min) = &path.minimum {
+            println!(
+                "    min: VRAM={} RAM={:.1} GB cores={}",
+                min.vram_gb
+                    .map(|v| format!("{v:.1} GB"))
+                    .unwrap_or_else(|| "n/a".to_string()),
+                min.ram_gb,
+                min.cpu_cores
+            );
+        }
+        if let Some(tps) = path.estimated_tps {
+            println!("    est speed: {:.1} tok/s", tps);
+        }
+    }
+    println!();
+
+    println!("{}", "Upgrade Deltas:".bold().underline());
+    if plan.upgrade_deltas.is_empty() {
+        println!("  None required for the selected target.");
+    } else {
+        for delta in &plan.upgrade_deltas {
+            println!("  {}", delta.description);
+        }
+    }
+    println!();
+
+    if !plan.kv_alternatives.is_empty() {
+        println!("{}", "KV Cache Alternatives:".bold().underline());
+        println!(
+            "  {:<8} {:>10} {:>10} {:>10}  notes",
+            "kv", "kv (GB)", "total", "savings"
+        );
+        for alt in &plan.kv_alternatives {
+            let label = if alt.supported {
+                alt.kv_quant.label().to_string()
+            } else {
+                format!("{} (n/a)", alt.kv_quant.label())
+            };
+            let savings_str = if alt.savings_fraction > 0.0 {
+                format!("-{:.0}%", alt.savings_fraction * 100.0)
+            } else {
+                "-".to_string()
+            };
+            let note = alt.note.as_deref().unwrap_or("");
+            println!(
+                "  {:<8} {:>10.2} {:>10.2} {:>10}  {}",
+                label, alt.kv_cache_gb, alt.memory_required_gb, savings_str, note
+            );
+        }
+        println!();
+    }
+}
+
+pub fn display_json_plan(plan: &PlanEstimate) {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(plan).expect("JSON serialization failed")
+    );
+}
+
+pub fn display_json_storage(specs: &SystemSpecs, storage: &StorageEstimate) -> Result<(), String> {
+    #[derive(serde::Serialize)]
+    struct Output<'a> {
+        system: serde_json::Value,
+        storage: &'a StorageEstimate,
+    }
+    let output = serde_json::to_string_pretty(&Output {
+        system: system_json(specs),
+        storage,
+    })
+    .map_err(|err| format!("Could not serialize storage estimate: {err}"))?;
+    println!("{output}");
+    Ok(())
+}
+
+pub fn display_storage(storage: &StorageEstimate) {
+    #[derive(Tabled)]
+    struct Row {
+        #[tabled(rename = "Model")]
+        name: String,
+        #[tabled(rename = "Quant")]
+        quant: String,
+        #[tabled(rename = "Fit")]
+        fit: String,
+        #[tabled(rename = "Runtime")]
+        runtime: &'static str,
+        #[tabled(rename = "Score")]
+        score: String,
+        #[tabled(rename = "Disk (GB)")]
+        disk: String,
+    }
+    let selection = match storage.selection {
+        StorageSelection::Score => "highest score",
+        StorageSelection::Largest => "largest weight storage",
+    };
+    println!(
+        "Library: {} of {} requested models ({} eligible; {selection})",
+        storage.selected_count, storage.keep_requested, storage.eligible_count
+    );
+    if !storage.models.is_empty() {
+        let rows = storage.models.iter().map(|model| Row {
+            name: model.name.clone(),
+            quant: model.best_quant.clone(),
+            fit: format!("{:?}", model.fit_level),
+            runtime: model.runtime.label(),
+            score: format!("{:.1}", model.score),
+            disk: format!("{:.2}", model.disk_size_gb),
+        });
+        println!("{}", Table::new(rows).with(Style::rounded()));
+    }
+    println!("Library weights: {:.2} GB", storage.library_gb);
+    println!("OS/apps reserve: {:.2} GB", storage.os_reserve_gb);
+    println!("Scratch: {:.2} GB", storage.download_scratch_gb);
+    println!("Required: {:.2} GB", storage.need_gb);
+    println!(
+        "Capacity target ({}% free): {:.2} GB",
+        storage.headroom_percent, storage.target_capacity_gb
+    );
+    let tier = |gb: Option<u32>| {
+        gb.map(|gb| format!("{gb} GB"))
+            .unwrap_or_else(|| "No recommendation".to_string())
+    };
+    println!("Minimum SSD: {}", tier(storage.minimum_ssd_gb));
+    println!("Suggested SSD: {}", tier(storage.suggested_ssd_gb));
+    println!("{}", storage.estimate_notice);
+    for warning in &storage.warnings {
+        println!("Warning: {warning}");
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// CSV export for spreadsheet / data analysis
+// ────────────────────────────────────────────────────────────────────
+
+/// Flat row struct for CSV serialization. Numerical fields are raw f64
+/// values (no units/percent signs) for easy import into spreadsheets.
+#[derive(serde::Serialize)]
+struct CsvFitRow {
+    name: String,
+    provider: String,
+    parameter_count: String,
+    params_billion: f64,
+    context_length: u32,
+    fit_level: String,
+    run_mode: String,
+    score: f64,
+    score_quality: f64,
+    score_speed: f64,
+    score_fit: f64,
+    score_context: f64,
+    estimated_tps: f64,
+    memory_required_gb: f64,
+    memory_available_gb: f64,
+    utilization_pct: f64,
+    disk_size_gb: f64,
+    best_quant: String,
+    runtime: String,
+    use_case: String,
+    release_date: Option<String>,
+    license: Option<String>,
+    is_moe: bool,
+    installed: bool,
+    runnable: bool,
+}
+
+/// Serialize model fits as CSV to stdout.
+pub fn display_csv_fits(fits: &[ModelFit]) {
+    let mut writer = csv::Writer::from_writer(std::io::stdout());
+
+    for fit in fits {
+        writer
+            .serialize(CsvFitRow {
+                name: fit.model.name.clone(),
+                provider: fit.model.provider.clone(),
+                parameter_count: fit.model.parameter_count.clone(),
+                params_billion: round2(fit.model.params_b()),
+                context_length: fit.model.context_length,
+                fit_level: fit.fit_text().to_lowercase(),
+                run_mode: fit.run_mode_text().to_lowercase(),
+                score: round1(fit.score),
+                score_quality: round1(fit.score_components.quality),
+                score_speed: round1(fit.score_components.speed),
+                score_fit: round1(fit.score_components.fit),
+                score_context: round1(fit.score_components.context),
+                estimated_tps: round1(fit.estimated_tps),
+                memory_required_gb: round2(fit.memory_required_gb),
+                memory_available_gb: round2(fit.memory_available_gb),
+                utilization_pct: round1(fit.utilization_pct),
+                disk_size_gb: round2(fit.model.estimate_disk_gb(&fit.best_quant)),
+                best_quant: fit.best_quant.clone(),
+                runtime: fit.runtime.label().to_string(),
+                use_case: fit.use_case.label().to_string(),
+                release_date: fit.model.release_date.clone(),
+                license: fit.model.license.clone(),
+                is_moe: fit.model.is_moe,
+                installed: fit.installed,
+                runnable: fit.fit_level != FitLevel::TooTight
+                    && fit.runtime != InferenceRuntime::Unsupported,
+            })
+            .expect("CSV serialization failed");
+    }
+
+    writer.flush().expect("CSV flush failed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_json_does_not_mark_backend_incompatible_info_as_runnable() {
+        use llmfit_core::hardware::GpuBackend;
+        use llmfit_core::models::UseCase;
+        let specs = SystemSpecs {
+            total_ram_gb: 64.0,
+            available_ram_gb: 64.0,
+            total_cpu_cores: 16,
+            cpu_name: "Test CPU".to_string(),
+            has_gpu: false,
+            gpu_vram_gb: None,
+            total_gpu_vram_gb: None,
+            gpu_available_gb: None,
+            gpu_name: None,
+            gpu_count: 0,
+            unified_memory: false,
+            backend: GpuBackend::CpuX86,
+            gpus: vec![],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        };
+        let mut fit = mock_fit(RunMode::CpuOnly, UseCase::General, "general");
+        assert_eq!(fit_to_json_for_specs(&fit, &specs)["runnable"], true);
+        fit.model.name = "mlx-community/test-7B".to_string();
+        assert_eq!(fit_to_json_for_specs(&fit, &specs)["runnable"], false);
+    }
+    use llmfit_core::fit::{FitLevel, InferenceRuntime, ScoreComponents};
+    use llmfit_core::models::{Capability, GgufSource, ModelFormat, UseCase};
+
+    fn mock_fit(run_mode: RunMode, use_case: UseCase, model_use_case: &str) -> ModelFit {
+        ModelFit {
+            model: LlmModel {
+                name: "test/model-7b".to_string(),
+                provider: "test".to_string(),
+                parameter_count: "7B".to_string(),
+                parameters_raw: None,
+                min_ram_gb: 4.0,
+                recommended_ram_gb: 8.0,
+                min_vram_gb: Some(4.0),
+                quantization: "Q4_K_M".to_string(),
+                context_length: 131_072,
+                use_case: model_use_case.to_string(),
+                is_moe: false,
+                num_experts: None,
+                active_experts: None,
+                active_parameters: None,
+                release_date: None,
+                gguf_sources: vec![GgufSource {
+                    repo: "test/model-7b-GGUF".to_string(),
+                    provider: "test".to_string(),
+                }],
+                capabilities: vec![],
+                languages: vec![],
+                format: ModelFormat::Gguf,
+                num_attention_heads: None,
+                num_key_value_heads: None,
+                num_hidden_layers: None,
+                head_dim: None,
+                attention_layout: None,
+                license: None,
+                hidden_size: None,
+                moe_intermediate_size: None,
+                vocab_size: None,
+                shared_expert_intermediate_size: None,
+                architecture: None,
+            },
+            fit_level: FitLevel::Good,
+            run_mode,
+            memory_required_gb: 4.0,
+            memory_available_gb: 8.0,
+            utilization_pct: 50.0,
+            notes: vec![],
+            moe_offloaded_gb: None,
+            score: 80.0,
+            score_components: ScoreComponents {
+                quality: 80.0,
+                speed: 80.0,
+                fit: 80.0,
+                context: 80.0,
+            },
+            estimated_tps: 30.0,
+            best_quant: "Q4_K_M".to_string(),
+            use_case,
+            runtime: InferenceRuntime::LlamaCpp,
+            installed: false,
+            fits_with_turboquant: false,
+            effective_context_length: 8_192,
+            usable_context: 8_192,
+            estimate_basis: Default::default(),
+            measured_tps: None,
+            estimate_confidence: llmfit_core::EstimateConfidence::Estimated,
+            prefill_tps: None,
+            ttft_ms: None,
+        }
+    }
+
+    #[test]
+    fn cli_json_keeps_legacy_vocab_while_shared_uses_codes() {
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        fit.model.capabilities = vec![Capability::ToolUse];
+
+        let cli = fit_to_json(&fit);
+        let shared = crate::serve_shared::fit_to_json(&fit);
+
+        // The CLI overlay preserves the human-readable values existing
+        // `fit --json` scripts depend on — unchanged from before the unification.
+        assert_eq!(cli["fit_level"], "Good");
+        assert_eq!(cli["run_mode"], "GPU");
+        assert_eq!(cli["runtime"], "llama.cpp");
+        assert_eq!(cli["capabilities"], serde_json::json!(["Tool Use"]));
+
+        // The shared (REST/MCP) envelope emits stable machine codes under the
+        // same keys, with the human string relocated to a `*_label` key.
+        assert_eq!(shared["fit_level"], "good");
+        assert_eq!(shared["fit_label"], "Good");
+        assert_eq!(shared["run_mode"], "gpu");
+        assert_eq!(shared["run_mode_label"], "GPU");
+        assert_eq!(shared["runtime"], "llamacpp");
+        assert_eq!(shared["runtime_label"], "llama.cpp");
+        assert_eq!(shared["capability_ids"], serde_json::json!(["tool_use"]));
+    }
+
+    #[test]
+    fn llamacpp_command_uses_effective_context() {
+        let fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+
+        let command = generate_llamacpp_command(&fit).expect("expected command");
+
+        assert!(command.contains("-c 8192"));
+        assert!(!command.contains("-c 131072"));
+    }
+
+    #[test]
+    fn llamacpp_command_uses_cpu_only_ngl_zero() {
+        let fit = mock_fit(RunMode::CpuOnly, UseCase::General, "general");
+
+        let command = generate_llamacpp_command(&fit).expect("expected command");
+
+        assert!(command.contains("-ngl 0"));
+        assert!(!command.contains("-ngl all"));
+    }
+
+    #[test]
+    fn llamacpp_offload_ngl_args_use_fit_only_when_supported() {
+        assert_eq!(
+            llamacpp_ngl_args_for_support(RunMode::CpuOffload, true),
+            Some("-ngl auto --fit on")
+        );
+        assert_eq!(
+            llamacpp_ngl_args_for_support(RunMode::CpuOffload, false),
+            Some("-ngl auto")
+        );
+        assert_eq!(
+            llamacpp_ngl_args_for_support(RunMode::MoeOffload, true),
+            Some("-ngl auto --fit on")
+        );
+        assert_eq!(
+            llamacpp_ngl_args_for_support(RunMode::MoeOffload, false),
+            Some("-ngl auto")
+        );
+    }
+
+    #[test]
+    fn llamacpp_command_omits_conversation_for_embeddings() {
+        let fit = mock_fit(RunMode::Gpu, UseCase::Embedding, "embedding");
+
+        let command = generate_llamacpp_command(&fit).expect("expected command");
+
+        assert!(!command.contains("-cnv"));
+    }
+
+    #[test]
+    fn llamacpp_command_includes_conversation_for_chat_and_instruct() {
+        let chat = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        let instruct = mock_fit(RunMode::Gpu, UseCase::General, "instruction tuned");
+
+        let chat_command = generate_llamacpp_command(&chat).expect("expected command");
+        let instruct_command = generate_llamacpp_command(&instruct).expect("expected command");
+
+        assert!(chat_command.contains("-cnv"));
+        assert!(instruct_command.contains("-cnv"));
+    }
+
+    #[test]
+    fn llamacpp_command_includes_conversation_for_tool_use() {
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::General, "general");
+        fit.model.capabilities.push(Capability::ToolUse);
+
+        let command = generate_llamacpp_command(&fit).expect("expected command");
+
+        assert!(command.contains("-cnv"));
+    }
+
+    #[test]
+    fn llamacpp_command_omits_tensor_parallel_suggestion() {
+        let fit = mock_fit(RunMode::TensorParallel, UseCase::Chat, "chat");
+
+        assert!(generate_llamacpp_command(&fit).is_none());
+    }
+
+    #[test]
+    fn fit_json_includes_effective_context_length() {
+        let fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+
+        let json = fit_to_json(&fit);
+
+        assert_eq!(json["context_length"], 131_072);
+        assert_eq!(json["effective_context_length"], 8_192);
+    }
+
+    #[test]
+    fn cli_json_carries_confidence_and_prefill_fields_through_unchanged() {
+        // The CLI overlay only rewrites fit_level/run_mode/runtime/capabilities;
+        // issue #969's additive fields must pass through from the shared
+        // envelope untouched.
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        fit.estimate_basis.local_calibration = Some(1.2);
+        fit.prefill_tps = Some(500.0);
+        fit.ttft_ms = Some(16.0);
+
+        let json = fit_to_json(&fit);
+
+        assert_eq!(json["estimate_confidence"], "calibrated");
+        assert_eq!(json["estimate_confidence_label"], "calibrated");
+        assert_eq!(json["prefill_tps"], 500.0);
+        assert_eq!(json["ttft_ms"], 16.0);
+    }
+
+    #[test]
+    fn display_best_quant_clears_gguf_label_for_native_low_precision_named_model() {
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        fit.model.name = "nvidia/Qwen3-8B-NVFP4".to_string();
+        fit.best_quant = "Q8_0".to_string();
+
+        assert_eq!(display_best_quant(&fit), "\u{2014}");
+    }
+
+    #[test]
+    fn display_best_quant_keeps_label_for_plain_gguf_model() {
+        let fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+
+        assert_eq!(display_best_quant(&fit), "Q4_K_M");
+    }
+
+    #[test]
+    fn table_confidence_cell_uses_the_short_code_not_the_full_label() {
+        use llmfit_core::benchmarks::{MeasuredSource, MeasuredTps};
+
+        // Estimated: nothing measured, nothing calibrated.
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        assert_eq!(confidence_cell(&fit), "est");
+
+        // Calibrated: a local calibration factor, still no measurement.
+        fit.estimate_basis.local_calibration = Some(1.2);
+        assert_eq!(confidence_cell(&fit), "calib");
+
+        // Measured beats calibrated, and is the case that used to render the
+        // 23-column "measured (this machine)" that wrapped the row (#974).
+        fit.measured_tps = Some(MeasuredTps {
+            tok_s: 42.0,
+            sample_count: 3,
+            hardware_label: "this machine".to_string(),
+            source: MeasuredSource::LocalBench,
+            match_grade: None,
+        });
+        assert_eq!(confidence_cell(&fit), "local");
+    }
+
+    #[test]
+    fn table_confidence_cell_reads_through_the_stale_stored_field() {
+        use llmfit_core::benchmarks::{MeasuredSource, MeasuredTps};
+
+        // `estimate_confidence` is only correct if every writer remembered to
+        // call refresh_estimate_confidence(); the table must derive it instead,
+        // or it prints "est" beside a measured tok/s figure (issue #969).
+        let mut fit = mock_fit(RunMode::Gpu, UseCase::Chat, "chat");
+        fit.measured_tps = Some(MeasuredTps {
+            tok_s: 42.0,
+            sample_count: 3,
+            hardware_label: "this machine".to_string(),
+            source: MeasuredSource::LocalBench,
+            match_grade: None,
+        });
+        // Deliberately left stale — no refresh_estimate_confidence() call.
+        assert_eq!(
+            fit.estimate_confidence,
+            llmfit_core::EstimateConfidence::Estimated
+        );
+
+        assert_eq!(confidence_cell(&fit), "local");
+    }
+}

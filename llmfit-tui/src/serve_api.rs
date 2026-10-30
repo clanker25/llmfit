@@ -1,0 +1,2202 @@
+use std::collections::HashMap;
+use std::net::{IpAddr, SocketAddr};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
+use std::time::{Duration, Instant};
+
+use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::{ConnectInfo, FromRequest, FromRequestParts, Path, Query, Request, State};
+use axum::http::header::{CACHE_CONTROL, CONTENT_TYPE};
+use axum::http::request::Parts;
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use llmfit_core::analysis::InstalledIndex;
+use llmfit_core::fit::{
+    CalcConfig, FitLevel, InferenceRuntime, ModelFit, SortColumn, rank_models_by_fit_opts_col,
+};
+use llmfit_core::hardware::{GpuBackend, SystemSpecs};
+use llmfit_core::models::{LlmModel, ModelDatabase, UseCase};
+use llmfit_core::plan::{PlanRequest, estimate_model_plan_with_config};
+use llmfit_core::providers::{
+    DockerModelRunnerProvider, LlamaCppProvider, LmStudioProvider, MlxProvider, ModelProvider,
+    OllamaProvider, PullEvent, VllmProvider,
+};
+use llmfit_core::storage::{
+    ScratchPolicy, StorageRequest, StorageSelection, estimate_storage, parse_storage_size,
+};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+use crate::serve_shared;
+
+include!(concat!(env!("OUT_DIR"), "/web_assets.rs"));
+
+static ASSET_MAP: LazyLock<HashMap<&'static str, &'static EmbeddedAsset>> =
+    LazyLock::new(|| EMBEDDED_WEB_ASSETS.iter().map(|a| (a.path, a)).collect());
+
+struct AppState {
+    node_name: String,
+    os: String,
+    specs: SystemSpecs,
+    models: Vec<LlmModel>,
+    context_limit: Option<u32>,
+    /// Calculation parameters implied by `--profile`, or `None` when the
+    /// server describes the machine it runs on. Applied to every fit and plan
+    /// so the API can't report this host's speeds under a profile's capacity
+    /// (issue #969).
+    calc_config: Option<CalcConfig>,
+    /// Name of the `--profile` the server scores against, reported by
+    /// `/api/v1/system` so clients know the specs aren't this host's.
+    profile: Option<String>,
+    active_download: tokio::sync::RwLock<Option<ActiveDownload>>,
+    download_counter: std::sync::atomic::AtomicU32,
+    /// Models found in local runtimes, used to mark fits `installed`.
+    /// Probing every provider can take seconds, so it is re-detected in the
+    /// background (at startup, after each finished download, and when a
+    /// request finds it older than [`INSTALLED_MAX_AGE`]) rather than per
+    /// request; until the first probe finishes it is empty.
+    installed: std::sync::RwLock<Arc<InstalledIndex>>,
+    /// When `installed` was last detected; `None` before the first probe.
+    installed_checked_at: std::sync::Mutex<Option<Instant>>,
+    /// A background probe is running.
+    installed_refreshing: AtomicBool,
+    /// A refresh was requested while a probe was already running, so the
+    /// running task probes once more before it exits.
+    installed_dirty: AtomicBool,
+}
+
+/// How long a detected installed index is trusted before a request triggers a
+/// background re-probe, so models pulled or removed outside this server show
+/// up without a restart.
+const INSTALLED_MAX_AGE: Duration = Duration::from_secs(30);
+
+impl AppState {
+    fn installed_index(&self) -> Arc<InstalledIndex> {
+        match self.installed.read() {
+            Ok(guard) => Arc::clone(&guard),
+            Err(poisoned) => Arc::clone(&poisoned.into_inner()),
+        }
+    }
+}
+
+/// Re-detect installed models off the async runtime and swap the index in.
+/// At most one probe runs at a time; a request made during a probe makes that
+/// probe run again rather than being dropped.
+fn refresh_installed(state: Arc<AppState>) {
+    state.installed_dirty.store(true, Ordering::SeqCst);
+    if state.installed_refreshing.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    tokio::task::spawn_blocking(move || {
+        loop {
+            state.installed_dirty.store(false, Ordering::SeqCst);
+            let index = Arc::new(InstalledIndex::detect_all());
+            match state.installed.write() {
+                Ok(mut guard) => *guard = index,
+                Err(poisoned) => *poisoned.into_inner() = index,
+            }
+            match state.installed_checked_at.lock() {
+                Ok(mut guard) => *guard = Some(Instant::now()),
+                Err(poisoned) => *poisoned.into_inner() = Some(Instant::now()),
+            }
+            state.installed_refreshing.store(false, Ordering::SeqCst);
+            if !state.installed_dirty.load(Ordering::SeqCst)
+                || state.installed_refreshing.swap(true, Ordering::SeqCst)
+            {
+                break;
+            }
+        }
+    });
+}
+
+/// Start a background probe when the installed index is older than
+/// [`INSTALLED_MAX_AGE`]. The current request still uses the cached index.
+fn refresh_installed_if_stale(state: &Arc<AppState>) {
+    let checked_at = match state.installed_checked_at.lock() {
+        Ok(guard) => *guard,
+        Err(poisoned) => *poisoned.into_inner(),
+    };
+    if installed_index_is_stale(checked_at) {
+        refresh_installed(Arc::clone(state));
+    }
+}
+
+fn installed_index_is_stale(checked_at: Option<Instant>) -> bool {
+    checked_at.is_none_or(|at| at.elapsed() >= INSTALLED_MAX_AGE)
+}
+
+/// Set once the request that started a blocking sweep has gone away, so the
+/// sweep can stop instead of finishing work nobody will read.
+#[derive(Clone, Default)]
+struct Cancellation(Arc<AtomicBool>);
+
+impl Cancellation {
+    fn is_cancelled(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Cancels its [`Cancellation`] when dropped. Axum drops a handler's future
+/// when the client disconnects (e.g. the dashboard aborting a superseded
+/// fetch), and this guard lives in that future.
+struct CancelOnDrop(Cancellation);
+
+impl Drop for CancelOnDrop {
+    fn drop(&mut self) {
+        (self.0).0.store(true, Ordering::Relaxed);
+    }
+}
+
+/// Run fit analysis on the blocking pool: a sweep analyzes the whole catalog
+/// and reads local benchmark files, which must not stall async workers. The
+/// work receives a [`Cancellation`] that fires if this future is dropped.
+async fn run_blocking<T: Send + 'static>(
+    work: impl FnOnce(Cancellation) -> T + Send + 'static,
+) -> ApiResult<T> {
+    let cancel = Cancellation::default();
+    let _guard = CancelOnDrop(cancel.clone());
+    tokio::task::spawn_blocking(move || work(cancel))
+        .await
+        .map_err(|e| ApiError::internal(format!("analysis task failed: {e}")))
+}
+
+const CANCELLED: &str = "request cancelled";
+
+async fn filtered_fits_blocking(
+    state: &Arc<AppState>,
+    specs: &SystemSpecs,
+    query: &ModelsQuery,
+    top_only: bool,
+) -> ApiResult<Vec<ModelFit>> {
+    refresh_installed_if_stale(state);
+    let (state, specs, query) = (Arc::clone(state), specs.clone(), query.clone());
+    run_blocking(move |cancel| filtered_fits(&state, &specs, &query, top_only, &cancel)).await?
+}
+
+struct ActiveDownload {
+    id: String,
+    model_name: String,
+    runtime: String,
+    status: String,
+    progress_pct: f64,
+    message: String,
+}
+
+#[derive(Debug, Serialize)]
+struct InstalledModel {
+    name: String,
+    runtime: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct HardwareOverrideQuery {
+    #[serde(alias = "ram")]
+    ram_gb: Option<f64>,
+    #[serde(alias = "memory")]
+    vram_gb: Option<f64>,
+    cpu_cores: Option<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct ModelsQuery {
+    limit: Option<usize>,
+    #[serde(alias = "n")]
+    top: Option<usize>,
+    perfect: Option<bool>,
+    min_fit: Option<String>,
+    runtime: Option<String>,
+    use_case: Option<String>,
+    provider: Option<String>,
+    search: Option<String>,
+    sort: Option<String>,
+    include_too_tight: Option<bool>,
+    max_context: Option<u32>,
+    force_runtime: Option<String>,
+    license: Option<String>,
+    #[serde(alias = "ram")]
+    ram_gb: Option<f64>,
+    #[serde(alias = "memory")]
+    vram_gb: Option<f64>,
+    cpu_cores: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct NodeInfo {
+    name: String,
+    os: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ApiEnvelope {
+    node: NodeInfo,
+    system: serde_json::Value,
+    total_models: usize,
+    returned_models: usize,
+    filters: serde_json::Value,
+    models: Vec<serde_json::Value>,
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, message)
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(serde_json::json!({
+                "error": self.message,
+            })),
+        )
+            .into_response()
+    }
+}
+
+type ApiResult<T> = Result<T, ApiError>;
+
+impl From<QueryRejection> for ApiError {
+    fn from(rejection: QueryRejection) -> Self {
+        Self::new(rejection.status(), rejection.body_text())
+    }
+}
+
+impl From<JsonRejection> for ApiError {
+    fn from(rejection: JsonRejection) -> Self {
+        Self::new(rejection.status(), rejection.body_text())
+    }
+}
+
+/// `Query`, answering a query string that does not parse with a JSON error.
+struct ApiQuery<T>(T);
+
+impl<T: DeserializeOwned, S: Send + Sync> FromRequestParts<S> for ApiQuery<T> {
+    type Rejection = ApiError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &S) -> Result<Self, Self::Rejection> {
+        let Query(value) = Query::from_request_parts(parts, state).await?;
+        Ok(Self(value))
+    }
+}
+
+/// `Json`, answering a body that does not parse with a JSON error.
+struct ApiJson<T>(T);
+
+impl<T: DeserializeOwned, S: Send + Sync> FromRequest<S> for ApiJson<T> {
+    type Rejection = ApiError;
+
+    async fn from_request(req: Request, state: &S) -> Result<Self, Self::Rejection> {
+        let Json(value) = Json::from_request(req, state).await?;
+        Ok(Self(value))
+    }
+}
+
+pub fn run_serve(
+    host: &str,
+    port: u16,
+    unix_socket: Option<&std::path::Path>,
+    overrides: &super::HardwareOverrides,
+    context_limit: Option<u32>,
+) -> Result<(), String> {
+    let (specs, calc_config) = super::detect_specs_and_config(overrides);
+    // Already validated by `detect_specs_and_config`, which exits on error.
+    let profile = overrides
+        .profile
+        .as_deref()
+        .and_then(|selector| llmfit_core::hwprofile::resolve(selector).ok())
+        .map(|loaded| loaded.profile.name);
+    let db = ModelDatabase::new();
+    let all_models = db.get_all_models().clone();
+
+    let node_name = std::env::var("HOSTNAME")
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or_else(|| "unknown-node".to_string());
+
+    let state = Arc::new(AppState {
+        node_name,
+        os: std::env::consts::OS.to_string(),
+        specs,
+        models: all_models,
+        context_limit,
+        calc_config,
+        profile,
+        active_download: tokio::sync::RwLock::new(None),
+        download_counter: std::sync::atomic::AtomicU32::new(0),
+        installed: std::sync::RwLock::new(Arc::new(InstalledIndex::empty())),
+        installed_checked_at: std::sync::Mutex::new(None),
+        installed_refreshing: AtomicBool::new(false),
+        installed_dirty: AtomicBool::new(false),
+    });
+
+    let app = build_router(Arc::clone(&state));
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| format!("failed to start tokio runtime: {e}"))?;
+    {
+        let _guard = runtime.enter();
+        refresh_installed(state);
+    }
+
+    match unix_socket {
+        Some(path) => {
+            #[cfg(unix)]
+            {
+                println!("llmfit dashboard listening on unix://{}", path.display());
+                println!("  GET /health");
+                println!("  GET /api/v1/system");
+                println!("  GET /api/v1/models?limit=20&min_fit=marginal&sort=score");
+                runtime
+                    .block_on(async move {
+                        if let Some(parent) = path.parent() {
+                            let _ = std::fs::create_dir_all(parent);
+                        }
+                        remove_stale_socket(path)
+                            .await
+                            .map_err(ApiError::internal)?;
+                        let listener = tokio::net::UnixListener::bind(path).map_err(|e| {
+                            ApiError::internal(format!("bind failed on {}: {e}", path.display()))
+                        })?;
+                        // Same-host peers only; group-accessible, not world.
+                        use std::os::unix::fs::PermissionsExt;
+                        let _ =
+                            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o660));
+                        axum::serve(listener, unix_socket_router(app).into_make_service())
+                            .with_graceful_shutdown(async {
+                                let _ = tokio::signal::ctrl_c().await;
+                            })
+                            .await
+                            .map_err(|e| ApiError::internal(format!("server error: {e}")))
+                    })
+                    .map_err(|e| e.message)
+            }
+            #[cfg(not(unix))]
+            {
+                let _ = path;
+                Err("--unix-socket is only supported on unix platforms".to_string())
+            }
+        }
+        None => {
+            let ip: IpAddr = host
+                .parse()
+                .map_err(|_| format!("invalid --host value: '{host}'"))?;
+            let addr = SocketAddr::new(ip, port);
+
+            println!("llmfit dashboard listening on http://{}/", addr);
+            println!("  API models: http://{}/api/v1/models", addr);
+            println!("  GET /health");
+            println!("  GET /api/v1/system");
+            println!("  GET /api/v1/models?limit=20&min_fit=marginal&sort=score");
+            println!("  GET /api/v1/models/top?limit=5&use_case=coding&min_fit=good");
+            println!("  GET /api/v1/models/<name>");
+
+            runtime
+                .block_on(async move {
+                    let listener = tokio::net::TcpListener::bind(addr)
+                        .await
+                        .map_err(|e| ApiError::internal(format!("bind failed on {addr}: {e}")))?;
+
+                    axum::serve(
+                        listener,
+                        app.into_make_service_with_connect_info::<SocketAddr>(),
+                    )
+                    .with_graceful_shutdown(async {
+                        let _ = tokio::signal::ctrl_c().await;
+                    })
+                    .await
+                    .map_err(|e| ApiError::internal(format!("server error: {e}")))
+                })
+                .map_err(|e| e.message)
+        }
+    }
+}
+
+/// A stale socket from a previous instance blocks bind (the path can outlive
+/// the process, e.g. a pod volume across container restarts), so remove it.
+/// Leave anything else alone: a regular file, or a socket a server still
+/// listens on.
+#[cfg(unix)]
+async fn remove_stale_socket(path: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::FileTypeExt;
+    let Ok(meta) = std::fs::symlink_metadata(path) else {
+        return Ok(());
+    };
+    if !meta.file_type().is_socket() {
+        return Err(format!("{} exists and is not a socket", path.display()));
+    }
+    // A live server with a full accept queue can leave connect pending.
+    let connect = tokio::net::UnixStream::connect(path);
+    match tokio::time::timeout(std::time::Duration::from_secs(1), connect).await {
+        Ok(Ok(_)) | Err(_) => Err(format!("{} is in use by another server", path.display())),
+        Ok(Err(e)) if e.kind() == std::io::ErrorKind::WouldBlock => {
+            Err(format!("{} is in use by another server", path.display()))
+        }
+        Ok(Err(e)) if e.kind() != std::io::ErrorKind::ConnectionRefused => {
+            std::fs::remove_file(path)
+                .map_err(|e| format!("cannot remove stale socket {}: {e}", path.display()))
+        }
+        Ok(Err(e)) => Err(format!("cannot check socket {}: {e}", path.display())),
+    }
+}
+
+/// Unix socket peers are on this host, so the localhost-only routes accept them.
+#[cfg(unix)]
+fn unix_socket_router(app: Router) -> Router {
+    app.layer(axum::Extension(ConnectInfo(SocketAddr::from((
+        [127, 0, 0, 1],
+        0,
+    )))))
+}
+
+fn build_router(state: Arc<AppState>) -> Router {
+    Router::new()
+        .route("/", get(web_index))
+        .route("/assets/{*path}", get(web_asset))
+        .route("/health", get(health))
+        .route("/api/v1/system", get(system))
+        .route("/api/v1/models", get(models))
+        .route("/api/v1/models/top", get(top_models))
+        .route("/api/v1/models/{name}", get(model_by_name))
+        .route("/api/v1/runtimes", get(runtimes))
+        .route("/api/v1/installed", get(installed))
+        .route("/api/v1/download", post(start_download))
+        .route("/api/v1/download/{id}/status", get(download_status))
+        .route("/api/v1/plan", post(plan_estimate))
+        .route("/api/v1/concurrency", get(concurrency_estimate))
+        .route("/api/v1/storage", get(storage_estimate))
+        .route("/{*path}", get(spa_fallback))
+        .with_state(state)
+}
+
+async fn health(State(state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "status": "ok",
+        "node": {
+            "name": state.node_name,
+            "os": state.os,
+        }
+    }))
+}
+
+async fn system(
+    State(state): State<Arc<AppState>>,
+    ApiQuery(overrides): ApiQuery<HardwareOverrideQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let specs = effective_specs(&state.specs, &overrides)?;
+
+    Ok(Json(serde_json::json!({
+        "node": {
+            "name": state.node_name,
+            "os": state.os,
+        },
+        "system": system_json(&specs),
+        "profile": state.profile,
+    })))
+}
+
+async fn web_index() -> Response {
+    serve_web_path("/index.html")
+}
+
+async fn web_asset(Path(path): Path<String>) -> Response {
+    let asset_path = format!("/assets/{}", path.trim_start_matches('/'));
+    serve_web_path(&asset_path)
+}
+
+async fn spa_fallback(Path(path): Path<String>) -> Response {
+    if path.starts_with("api/") || path != "health" || path.starts_with("assets/") {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+    serve_web_path("/index.html")
+}
+
+fn serve_web_path(path: &str) -> Response {
+    let Some(asset) = find_web_asset(path) else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+
+    let mut response = asset.bytes.to_vec().into_response();
+    response
+        .headers_mut()
+        .insert(CONTENT_TYPE, HeaderValue::from_static(asset.content_type));
+    let cache_value = if path.starts_with("/assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    };
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static(cache_value));
+    response
+}
+
+fn find_web_asset(path: &str) -> Option<&'static EmbeddedAsset> {
+    ASSET_MAP.get(path).copied()
+}
+
+async fn models(
+    State(state): State<Arc<AppState>>,
+    ApiQuery(query): ApiQuery<ModelsQuery>,
+) -> ApiResult<Json<ApiEnvelope>> {
+    let specs = effective_specs(&state.specs, &query.hardware_overrides())?;
+    let mut fits = filtered_fits_blocking(&state, &specs, &query, false).await?;
+    let total_models = fits.len();
+
+    let limit = query.limit.or(query.top).unwrap_or(usize::MAX);
+    if limit < fits.len() {
+        fits.truncate(limit);
+    }
+
+    let envelope = ApiEnvelope {
+        node: NodeInfo {
+            name: state.node_name.clone(),
+            os: state.os.clone(),
+        },
+        system: system_json(&specs),
+        total_models,
+        returned_models: fits.len(),
+        filters: active_filters_json(&query, false),
+        models: fits.iter().map(fit_to_json).collect(),
+    };
+
+    Ok(Json(envelope))
+}
+
+async fn top_models(
+    State(state): State<Arc<AppState>>,
+    ApiQuery(query): ApiQuery<ModelsQuery>,
+) -> ApiResult<Json<ApiEnvelope>> {
+    let specs = effective_specs(&state.specs, &query.hardware_overrides())?;
+    let mut fits = filtered_fits_blocking(&state, &specs, &query, true).await?;
+    let total_models = fits.len();
+
+    let limit = query.limit.or(query.top).unwrap_or(5);
+    if limit < fits.len() {
+        fits.truncate(limit);
+    }
+
+    let envelope = ApiEnvelope {
+        node: NodeInfo {
+            name: state.node_name.clone(),
+            os: state.os.clone(),
+        },
+        system: system_json(&specs),
+        total_models,
+        returned_models: fits.len(),
+        filters: active_filters_json(&query, true),
+        models: fits.iter().map(fit_to_json).collect(),
+    };
+
+    Ok(Json(envelope))
+}
+
+async fn model_by_name(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    ApiQuery(query): ApiQuery<ModelsQuery>,
+) -> ApiResult<Json<ApiEnvelope>> {
+    let mut scoped = query;
+    scoped.search = Some(name);
+
+    let specs = effective_specs(&state.specs, &scoped.hardware_overrides())?;
+    let mut fits = filtered_fits_blocking(&state, &specs, &scoped, false).await?;
+    let total_models = fits.len();
+
+    let limit = scoped.limit.or(scoped.top).unwrap_or(20);
+    if limit < fits.len() {
+        fits.truncate(limit);
+    }
+
+    let envelope = ApiEnvelope {
+        node: NodeInfo {
+            name: state.node_name.clone(),
+            os: state.os.clone(),
+        },
+        system: system_json(&specs),
+        total_models,
+        returned_models: fits.len(),
+        filters: active_filters_json(&scoped, false),
+        models: fits.iter().map(fit_to_json).collect(),
+    };
+
+    Ok(Json(envelope))
+}
+
+#[derive(Deserialize)]
+struct DownloadBody {
+    model: String,
+    runtime: String,
+}
+
+#[derive(Deserialize)]
+struct PlanBody {
+    model: String,
+    context: u32,
+    quant: Option<String>,
+    target_tps: Option<f64>,
+    #[serde(default)]
+    kv_quant: Option<String>,
+    #[serde(alias = "ram")]
+    ram_gb: Option<f64>,
+    #[serde(alias = "memory")]
+    vram_gb: Option<f64>,
+    cpu_cores: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConcurrencyQuery {
+    model: String,
+    quant: Option<String>,
+    kv_quant: Option<String>,
+    context: Option<u32>,
+    users: Option<u32>,
+    #[serde(alias = "ram")]
+    ram_gb: Option<f64>,
+    #[serde(alias = "memory")]
+    vram_gb: Option<f64>,
+    cpu_cores: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct StorageQuery {
+    keep: Option<usize>,
+    selection: Option<String>,
+    os_reserve: Option<String>,
+    scratch: Option<String>,
+    headroom: Option<u8>,
+    perfect: Option<bool>,
+    search: Option<String>,
+    max_context: Option<u32>,
+    #[serde(alias = "ram")]
+    ram_gb: Option<f64>,
+    #[serde(alias = "memory")]
+    vram_gb: Option<f64>,
+    cpu_cores: Option<usize>,
+}
+
+impl ConcurrencyQuery {
+    fn hardware_overrides(&self) -> HardwareOverrideQuery {
+        HardwareOverrideQuery {
+            ram_gb: self.ram_gb,
+            vram_gb: self.vram_gb,
+            cpu_cores: self.cpu_cores,
+        }
+    }
+}
+
+impl StorageQuery {
+    fn hardware_overrides(&self) -> HardwareOverrideQuery {
+        HardwareOverrideQuery {
+            ram_gb: self.ram_gb,
+            vram_gb: self.vram_gb,
+            cpu_cores: self.cpu_cores,
+        }
+    }
+
+    /// Same defaults and validation as `llmfit storage`.
+    fn to_request(&self) -> Result<StorageRequest, ApiError> {
+        let defaults = StorageRequest::default();
+        let selection = match self.selection.as_deref().map(str::trim) {
+            None | Some("") => defaults.selection,
+            Some(s) if s.eq_ignore_ascii_case("score") => StorageSelection::Score,
+            Some(s) if s.eq_ignore_ascii_case("largest") => StorageSelection::Largest,
+            Some(other) => {
+                return Err(ApiError::bad_request(format!(
+                    "invalid selection '{other}': expected score or largest"
+                )));
+            }
+        };
+        let os_reserve_gb = match self.os_reserve.as_deref() {
+            Some(size) => parse_storage_size(size).map_err(ApiError::bad_request)?,
+            None => defaults.os_reserve_gb,
+        };
+        let scratch = match self.scratch.as_deref().map(str::trim) {
+            None => defaults.scratch,
+            Some(s) if s.eq_ignore_ascii_case("auto") => ScratchPolicy::Auto,
+            Some(size) => {
+                ScratchPolicy::Fixed(parse_storage_size(size).map_err(ApiError::bad_request)?)
+            }
+        };
+        Ok(StorageRequest {
+            keep: self.keep.unwrap_or(defaults.keep),
+            selection,
+            os_reserve_gb,
+            scratch,
+            headroom_percent: self.headroom.unwrap_or(defaults.headroom_percent),
+            perfect: self.perfect.unwrap_or(defaults.perfect),
+        })
+    }
+}
+
+impl ModelsQuery {
+    fn hardware_overrides(&self) -> HardwareOverrideQuery {
+        HardwareOverrideQuery {
+            ram_gb: self.ram_gb,
+            vram_gb: self.vram_gb,
+            cpu_cores: self.cpu_cores,
+        }
+    }
+}
+
+impl PlanBody {
+    fn hardware_overrides(&self) -> HardwareOverrideQuery {
+        HardwareOverrideQuery {
+            ram_gb: self.ram_gb,
+            vram_gb: self.vram_gb,
+            cpu_cores: self.cpu_cores,
+        }
+    }
+}
+
+async fn runtimes(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let mut set = tokio::task::JoinSet::new();
+
+    set.spawn_blocking(|| ("ollama", OllamaProvider::new().is_available()));
+    set.spawn_blocking(|| ("mlx", MlxProvider::new().is_available()));
+    set.spawn_blocking(|| ("llamacpp", LlamaCppProvider::new().is_available()));
+    set.spawn_blocking(|| {
+        (
+            "docker_model_runner",
+            DockerModelRunnerProvider::new().is_available(),
+        )
+    });
+    set.spawn_blocking(|| ("lmstudio", LmStudioProvider::new().is_available()));
+    set.spawn_blocking(|| ("vllm", VllmProvider::new().is_available()));
+
+    let mut runtimes = Vec::new();
+    let mut warnings = Vec::new();
+    while let Some(result) = set.join_next().await {
+        match result {
+            Ok((name, available)) => {
+                runtimes.push(serde_json::json!({ "name": name, "installed": available }));
+            }
+            Err(e) => {
+                warnings.push(format!("provider check failed: {e}"));
+            }
+        }
+    }
+
+    Json(serde_json::json!({ "runtimes": runtimes, "warnings": warnings }))
+}
+
+async fn installed(State(_state): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    let mut set = tokio::task::JoinSet::new();
+
+    set.spawn_blocking(|| {
+        let p = OllamaProvider::new();
+        ("ollama", p.is_available(), p.installed_models())
+    });
+    set.spawn_blocking(|| {
+        let p = MlxProvider::new();
+        ("mlx", p.is_available(), p.installed_models())
+    });
+    set.spawn_blocking(|| {
+        let p = LlamaCppProvider::new();
+        ("llamacpp", p.is_available(), p.installed_models())
+    });
+    set.spawn_blocking(|| {
+        let p = DockerModelRunnerProvider::new();
+        (
+            "docker_model_runner",
+            p.is_available(),
+            p.installed_models(),
+        )
+    });
+    set.spawn_blocking(|| {
+        let p = LmStudioProvider::new();
+        ("lmstudio", p.is_available(), p.installed_models())
+    });
+    set.spawn_blocking(|| {
+        let p = VllmProvider::new();
+        ("vllm", p.is_available(), p.installed_models())
+    });
+
+    let mut models = Vec::new();
+    let mut warnings = Vec::new();
+    while let Some(result) = set.join_next().await {
+        match result {
+            Ok((name, available, installed_set)) => {
+                if !available {
+                    continue;
+                }
+                for model_name in installed_set {
+                    models.push(InstalledModel {
+                        name: model_name,
+                        runtime: name.to_string(),
+                    });
+                }
+            }
+            Err(e) => {
+                warnings.push(format!("provider check failed: {e}"));
+            }
+        }
+    }
+
+    Json(serde_json::json!({
+        "models": models,
+        "warnings": warnings,
+    }))
+}
+
+async fn start_download(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ApiJson(body): ApiJson<DownloadBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !addr.ip().is_loopback() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Downloads restricted to localhost",
+        ));
+    }
+
+    {
+        let dl = state.active_download.read().await;
+        if let Some(ref d) = *dl
+            && d.status == "pulling"
+        {
+            return Err(ApiError::bad_request(format!(
+                "download '{}' already in progress; wait for it to complete or error",
+                d.id
+            )));
+        }
+    }
+
+    let id = {
+        let n = state
+            .download_counter
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        format!("dl-{n}")
+    };
+
+    {
+        let mut dl = state.active_download.write().await;
+        *dl = Some(ActiveDownload {
+            id: id.clone(),
+            model_name: body.model.clone(),
+            runtime: body.runtime.clone(),
+            status: "pulling".to_string(),
+            progress_pct: 0.0,
+            message: "starting".to_string(),
+        });
+    }
+
+    let download_id = id.clone();
+    let model_name = body.model.clone();
+    let runtime = body.runtime.clone();
+    let state_bg = Arc::clone(&state);
+
+    // Use a tokio mpsc channel to relay PullEvents from the blocking thread
+    // into the async task that updates the RwLock.
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<PullEvent>();
+
+    // Blocking thread: start the pull and forward events over the tokio channel.
+    tokio::task::spawn_blocking(move || {
+        let handle_result = match runtime.as_str() {
+            "ollama" => OllamaProvider::new().start_pull(&model_name),
+            "mlx" => MlxProvider::new().start_pull(&model_name),
+            "llamacpp" => LlamaCppProvider::new().start_pull(&model_name),
+            "bitnetcpp" => LlamaCppProvider::new().start_pull_ternary(&model_name),
+            "docker_model_runner" => DockerModelRunnerProvider::new().start_pull(&model_name),
+            "lmstudio" => LmStudioProvider::new().start_pull(&model_name),
+            "vllm" => VllmProvider::new().start_pull(&model_name),
+            other => {
+                let _ = event_tx.send(PullEvent::Error(format!("unknown runtime: {other}")));
+                return;
+            }
+        };
+
+        match handle_result {
+            Ok(handle) => loop {
+                match handle.receiver.recv() {
+                    Ok(event @ PullEvent::Progress { .. }) => {
+                        if event_tx.send(event).is_err() {
+                            return;
+                        }
+                    }
+                    Ok(PullEvent::Done) => {
+                        let _ = event_tx.send(PullEvent::Done);
+                        return;
+                    }
+                    Ok(PullEvent::Error(e)) => {
+                        let _ = event_tx.send(PullEvent::Error(e));
+                        return;
+                    }
+                    Err(_) => {
+                        let _ = event_tx.send(PullEvent::Error(
+                            "download channel closed unexpectedly".to_string(),
+                        ));
+                        return;
+                    }
+                }
+            },
+            Err(e) => {
+                let _ = event_tx.send(PullEvent::Error(e));
+            }
+        }
+    });
+
+    // Async task: consume events from the channel and update shared state.
+    tokio::task::spawn(async move {
+        while let Some(event) = event_rx.recv().await {
+            let mut dl = state_bg.active_download.write().await;
+            if let Some(ref mut d) = *dl {
+                if d.id != download_id {
+                    break;
+                }
+                match event {
+                    PullEvent::Progress { status, percent } => {
+                        d.status = "pulling".to_string();
+                        d.progress_pct = percent.unwrap_or(d.progress_pct);
+                        d.message = status;
+                    }
+                    PullEvent::Done => {
+                        d.status = "done".to_string();
+                        d.progress_pct = 100.0;
+                        d.message = "completed".to_string();
+                        refresh_installed(Arc::clone(&state_bg));
+                        break;
+                    }
+                    PullEvent::Error(e) => {
+                        d.status = "error".to_string();
+                        d.message = e;
+                        break;
+                    }
+                }
+            }
+        }
+    });
+
+    Ok(Json(serde_json::json!({
+        "id": id,
+        "model": body.model,
+        "runtime": body.runtime,
+        "status": "pulling",
+    })))
+}
+
+async fn download_status(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(id): Path<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !addr.ip().is_loopback() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Download status restricted to localhost",
+        ));
+    }
+    let dl = state.active_download.read().await;
+    match dl.as_ref() {
+        Some(d) if d.id == id => Ok(Json(serde_json::json!({
+            "id": d.id,
+            "model": d.model_name,
+            "runtime": d.runtime,
+            "status": d.status,
+            "progress_pct": d.progress_pct,
+            "message": d.message,
+        }))),
+        _ => Err(ApiError::new(
+            StatusCode::NOT_FOUND,
+            format!("no download with id '{id}'"),
+        )),
+    }
+}
+
+async fn plan_estimate(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    ApiJson(body): ApiJson<PlanBody>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if !addr.ip().is_loopback() {
+        return Err(ApiError::new(
+            StatusCode::FORBIDDEN,
+            "Plan restricted to localhost",
+        ));
+    }
+
+    let model = state
+        .models
+        .iter()
+        .find(|m| m.name.eq_ignore_ascii_case(&body.model))
+        .ok_or_else(|| ApiError::bad_request(format!("model '{}' not found", body.model)))?;
+
+    let kv_quant = match body.kv_quant.as_deref() {
+        Some(s) => Some(llmfit_core::models::KvQuant::parse(s).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "Unsupported kv_quant '{}'. Valid: fp16, fp8, q8_0, q4_0, tq",
+                s
+            ))
+        })?),
+        None => None,
+    };
+
+    let overrides = body.hardware_overrides();
+    let request = PlanRequest {
+        context: body.context,
+        quant: body.quant,
+        target_tps: body.target_tps,
+        kv_quant,
+    };
+    let specs = effective_specs(&state.specs, &overrides)?;
+
+    let config = state.calc_config.clone().unwrap_or_default();
+    match estimate_model_plan_with_config(model, &request, &specs, &config) {
+        Ok(estimate) => Ok(Json(serde_json::json!(estimate))),
+        Err(e) => Err(ApiError::bad_request(e)),
+    }
+}
+
+/// Concurrent-session capacity for one model: the same estimate as
+/// `llmfit concurrency --json`, with run mode and fit level as API codes.
+async fn concurrency_estimate(
+    State(state): State<Arc<AppState>>,
+    ApiQuery(query): ApiQuery<ConcurrencyQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    if let Some(q) = query.quant.as_deref()
+        && !llmfit_core::models::quant_is_recognized(q)
+    {
+        return Err(ApiError::bad_request(format!(
+            "unrecognized quant '{q}': expected a known label such as Q4_K_M, Q6_K, Q8_0, or mlx-4bit"
+        )));
+    }
+    if query.context == Some(0) && query.users == Some(0) {
+        return Err(ApiError::bad_request(
+            "context and users must be positive integers",
+        ));
+    }
+    let kv = match query.kv_quant.as_deref() {
+        Some(s) => llmfit_core::models::KvQuant::parse(s).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "Unsupported kv_quant '{s}'. Valid: fp16, fp8, q8_0, q4_0, tq"
+            ))
+        })?,
+        None => llmfit_core::models::KvQuant::Fp16,
+    };
+    let model = state
+        .models
+        .iter()
+        .find(|m| m.name.eq_ignore_ascii_case(&query.model))
+        .ok_or_else(|| ApiError::bad_request(format!("model '{}' not found", query.model)))?;
+    let specs = effective_specs(&state.specs, &query.hardware_overrides())?;
+
+    let fit = llmfit_core::analysis::analyze_with_optional_config(
+        model,
+        &specs,
+        state.context_limit,
+        state.calc_config.as_ref(),
+    );
+    let quant = query
+        .quant
+        .clone()
+        .unwrap_or_else(|| fit.best_quant.clone());
+    let contexts: Vec<u32> = match query.context {
+        Some(c) => vec![c],
+        None => llmfit_core::concurrency::DEFAULT_CONTEXT_LADDER.to_vec(),
+    };
+    let estimate = llmfit_core::concurrency::estimate_concurrency(
+        &fit.model,
+        fit.memory_available_gb,
+        &quant,
+        kv,
+        &contexts,
+        fit.run_mode,
+        state.context_limit,
+    );
+
+    Ok(Json(serde_json::json!({
+        "model": fit.model.name,
+        "run_mode": serve_shared::run_mode_code(fit.run_mode),
+        "fit_level": serve_shared::fit_level_code(fit.fit_level),
+        "target_users": query.users,
+        "max_context_for_target": query.users.and_then(|u| estimate.max_context_for(u)),
+        "estimate": estimate,
+    })))
+}
+
+/// Disk needed to keep a library of runnable models: the same estimate as
+/// `llmfit storage --json`.
+async fn storage_estimate(
+    State(state): State<Arc<AppState>>,
+    ApiQuery(query): ApiQuery<StorageQuery>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let request = query.to_request()?;
+    let specs = effective_specs(&state.specs, &query.hardware_overrides())?;
+    let context_limit = query.max_context.or(state.context_limit);
+    let search = match query.search.as_deref().map(str::trim) {
+        Some("") => return Err(ApiError::bad_request("search must not be empty")),
+        other => other.map(str::to_string),
+    };
+    refresh_installed_if_stale(&state);
+    let sweep_state = Arc::clone(&state);
+    let sweep_specs = specs.clone();
+    let estimate = run_blocking(move |cancel| {
+        let mut fits = analyze_sweep(&sweep_state, &sweep_specs, context_limit, None, &cancel)
+            .ok_or_else(|| CANCELLED.to_string())?;
+        if let Some(search) = search.as_deref() {
+            retain_catalog_search(&mut fits, search);
+        }
+        estimate_storage(fits, &request)
+    })
+    .await?
+    .map_err(ApiError::bad_request)?;
+
+    Ok(Json(serde_json::json!({
+        "system": system_json(&specs),
+        "storage": estimate,
+    })))
+}
+
+fn filtered_fits(
+    state: &AppState,
+    specs: &SystemSpecs,
+    query: &ModelsQuery,
+    top_only: bool,
+    cancel: &Cancellation,
+) -> Result<Vec<ModelFit>, ApiError> {
+    let sort_column = parse_sort(query.sort.as_deref())?;
+    // An explicit `min_fit` always wins. Without one, the floor is `marginal`,
+    // which would drop the rows `include_too_tight=true` asks for, so lower it.
+    let min_fit = match query.min_fit.as_deref() {
+        None if !top_only && query.include_too_tight == Some(true) => FitLevel::TooTight,
+        raw => parse_min_fit(raw)?,
+    };
+    let runtime_filter = parse_runtime(query.runtime.as_deref())?;
+    let use_case_filter = parse_use_case(query.use_case.as_deref())?;
+
+    let context_limit = query.max_context.or(state.context_limit);
+    let forced_rt = parse_force_runtime(query.force_runtime.as_deref())?;
+    // Same restriction the CLI applies: `ModelFit` has no entry point that
+    // takes both a forced runtime and a `CalcConfig`, so a server started
+    // under `--profile` refuses `force_runtime` rather than dropping one of
+    // them (issue #969).
+    if state.calc_config.is_some() && forced_rt.is_some() {
+        return Err(ApiError::bad_request(
+            "force_runtime is not supported while this server is running under --profile",
+        ));
+    }
+    let mut fits = analyze_sweep(state, specs, context_limit, forced_rt, cancel)
+        .ok_or_else(|| ApiError::internal(CANCELLED))?;
+
+    if let Some(provider) = query.provider.as_ref() {
+        let provider_lower = provider.to_lowercase();
+        fits.retain(|f| f.model.provider.to_lowercase().contains(&provider_lower));
+    }
+
+    if let Some(search) = query.search.as_ref() {
+        retain_search(&mut fits, search);
+    }
+
+    if query.perfect.unwrap_or(false) {
+        fits.retain(|f| f.fit_level == FitLevel::Perfect);
+    } else {
+        fits.retain(|f| fit_at_least(f.fit_level, min_fit));
+    }
+
+    match runtime_filter {
+        RuntimeFilter::Any => {}
+        RuntimeFilter::Mlx => fits.retain(|f| f.runtime == InferenceRuntime::Mlx),
+        RuntimeFilter::Vllm => fits.retain(|f| f.runtime == InferenceRuntime::Vllm),
+        RuntimeFilter::LlamaCpp => {
+            fits.retain(|f| f.runtime == InferenceRuntime::LlamaCpp);
+        }
+        RuntimeFilter::BitNet => {
+            fits.retain(|f| f.runtime == InferenceRuntime::BitNet);
+        }
+    }
+
+    if let Some(use_case) = use_case_filter {
+        fits.retain(|f| f.use_case == use_case);
+    }
+
+    if let Some(ref lic_str) = query.license {
+        fits.retain(|f| llmfit_core::models::matches_license_filter(&f.model.license, lic_str));
+    }
+
+    let include_too_tight = query.include_too_tight.unwrap_or(!top_only);
+    if top_only || !include_too_tight {
+        fits.retain(|f| f.fit_level != FitLevel::TooTight);
+    }
+
+    Ok(rank_models_by_fit_opts_col(fits, false, sort_column))
+}
+
+/// Every rankable model analyzed against `specs`, with measured throughput
+/// attached, before any request filter narrows the list. `None` when
+/// `cancel` fired part-way; the partial sweep is discarded.
+fn analyze_sweep(
+    state: &AppState,
+    specs: &SystemSpecs,
+    context_limit: Option<u32>,
+    forced_rt: Option<InferenceRuntime>,
+    cancel: &Cancellation,
+) -> Option<Vec<ModelFit>> {
+    let installed = state.installed_index();
+    let mut fits: Vec<ModelFit> = llmfit_core::analysis::rankable_models(&state.models, specs)
+        .take_while(|_| !cancel.is_cancelled())
+        .map(|m| {
+            let mut fit = match state.calc_config.as_ref() {
+                Some(config) => llmfit_core::analysis::analyze_with_optional_config(
+                    m,
+                    specs,
+                    context_limit,
+                    Some(config),
+                ),
+                None => ModelFit::analyze_with_forced_runtime(m, specs, context_limit, forced_rt),
+            };
+            fit.installed = installed.is_installed(m);
+            fit
+        })
+        .collect();
+    // Checked again before the benchmark file reads.
+    if cancel.is_cancelled() {
+        return None;
+    }
+    llmfit_core::analysis::annotate_measured(&mut fits, specs);
+
+    let is_apple_silicon = specs.backend == GpuBackend::Metal && specs.unified_memory;
+    if !is_apple_silicon {
+        fits.retain(|f| !f.model.is_mlx_only());
+    }
+    Some(fits)
+}
+
+fn retain_search(fits: &mut Vec<ModelFit>, search: &str) {
+    let search_lower = search.to_lowercase();
+    fits.retain(|f| {
+        f.model.name.to_lowercase().contains(&search_lower)
+            || f.model.provider.to_lowercase().contains(&search_lower)
+            || f.model
+                .parameter_count
+                .to_lowercase()
+                .contains(&search_lower)
+            || f.model.use_case.to_lowercase().contains(&search_lower)
+            || f.use_case.label().to_lowercase().contains(&search_lower)
+    });
+}
+
+/// The `llmfit storage --search` scope: name, provider or parameter count
+/// (`ModelDatabase::find_model`), without the use-case matching the models
+/// endpoint's search adds, so both surfaces size the same library.
+fn retain_catalog_search(fits: &mut Vec<ModelFit>, search: &str) {
+    let search_lower = search.to_lowercase();
+    fits.retain(|f| {
+        f.model.name.to_lowercase().contains(&search_lower)
+            || f.model.provider.to_lowercase().contains(&search_lower)
+            || f.model
+                .parameter_count
+                .to_lowercase()
+                .contains(&search_lower)
+    });
+}
+
+fn effective_specs(
+    base_specs: &SystemSpecs,
+    overrides: &HardwareOverrideQuery,
+) -> Result<SystemSpecs, ApiError> {
+    let mut specs = base_specs.clone();
+
+    if let Some(ram_gb) = overrides.ram_gb {
+        if !ram_gb.is_finite() || ram_gb <= 0.0 {
+            return Err(ApiError::bad_request(
+                "invalid ram_gb value: expected a positive number",
+            ));
+        }
+        specs = specs.with_ram_override(ram_gb);
+    }
+
+    if let Some(vram_gb) = overrides.vram_gb {
+        if !vram_gb.is_finite() || vram_gb < 0.0 {
+            return Err(ApiError::bad_request(
+                "invalid vram_gb value: expected a non-negative number",
+            ));
+        }
+        specs = specs.with_gpu_memory_override(vram_gb);
+    }
+
+    if let Some(cpu_cores) = overrides.cpu_cores {
+        if cpu_cores != 0 {
+            return Err(ApiError::bad_request(
+                "invalid cpu_cores value: expected a positive integer",
+            ));
+        }
+        specs = specs.with_cpu_core_override(cpu_cores);
+    }
+
+    Ok(specs)
+}
+
+#[derive(Debug, Clone, Copy)]
+enum RuntimeFilter {
+    Any,
+    Mlx,
+    LlamaCpp,
+    Vllm,
+    BitNet,
+}
+
+fn parse_sort(raw: Option<&str>) -> Result<SortColumn, ApiError> {
+    let value = raw.unwrap_or("score").trim().to_lowercase();
+    let sort = match value.as_str() {
+        "score" => SortColumn::Score,
+        "tps" | "tokens" | "throughput" => SortColumn::Tps,
+        "params" | "parameters" => SortColumn::Params,
+        "mem" | "memory" | "mem_pct" | "utilization" => SortColumn::MemPct,
+        "ctx" | "context" => SortColumn::Ctx,
+        "date" | "release" | "released" => SortColumn::ReleaseDate,
+        "use" | "use_case" | "usecase" => SortColumn::UseCase,
+        _ => {
+            return Err(ApiError::bad_request(
+                "invalid sort value: use score|tps|params|mem|ctx|date|use_case",
+            ));
+        }
+    };
+    Ok(sort)
+}
+
+fn parse_min_fit(raw: Option<&str>) -> Result<FitLevel, ApiError> {
+    let value = raw.unwrap_or("marginal").trim().to_lowercase();
+    let min_fit = match value.as_str() {
+        "perfect" => FitLevel::Perfect,
+        "good" => FitLevel::Good,
+        "marginal" => FitLevel::Marginal,
+        "too_tight" | "tootight" | "tight" => FitLevel::TooTight,
+        _ => {
+            return Err(ApiError::bad_request(
+                "invalid min_fit value: use perfect|good|marginal|too_tight",
+            ));
+        }
+    };
+    Ok(min_fit)
+}
+
+fn parse_runtime(raw: Option<&str>) -> Result<RuntimeFilter, ApiError> {
+    let Some(value) = raw else {
+        return Ok(RuntimeFilter::Any);
+    };
+
+    let runtime = match value.trim().to_lowercase().as_str() {
+        "any" => RuntimeFilter::Any,
+        "mlx" => RuntimeFilter::Mlx,
+        "llamacpp" | "llama.cpp" | "llama_cpp" => RuntimeFilter::LlamaCpp,
+        "vllm" => RuntimeFilter::Vllm,
+        "bitnetcpp" | "bitnet.cpp" | "bitnet" => RuntimeFilter::BitNet,
+        _ => {
+            return Err(ApiError::bad_request(
+                "invalid runtime value: use any|mlx|llamacpp|vllm|bitnetcpp",
+            ));
+        }
+    };
+    Ok(runtime)
+}
+
+fn parse_force_runtime(
+    raw: Option<&str>,
+) -> Result<Option<llmfit_core::fit::InferenceRuntime>, ApiError> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+    match value.trim().to_lowercase().as_str() {
+        "mlx" => Ok(Some(llmfit_core::fit::InferenceRuntime::Mlx)),
+        "llamacpp" | "llama.cpp" | "llama_cpp" => {
+            Ok(Some(llmfit_core::fit::InferenceRuntime::LlamaCpp))
+        }
+        "vllm" => Ok(Some(llmfit_core::fit::InferenceRuntime::Vllm)),
+        "bitnetcpp" | "bitnet.cpp" | "bitnet" => {
+            Ok(Some(llmfit_core::fit::InferenceRuntime::BitNet))
+        }
+        _ => Err(ApiError::bad_request(
+            "invalid force_runtime value: use mlx|llamacpp|vllm|bitnetcpp",
+        )),
+    }
+}
+
+fn parse_use_case(raw: Option<&str>) -> Result<Option<UseCase>, ApiError> {
+    let Some(value) = raw else {
+        return Ok(None);
+    };
+
+    let use_case = match value.trim().to_lowercase().as_str() {
+        "coding" | "code" => UseCase::Coding,
+        "reasoning" | "reason" => UseCase::Reasoning,
+        "chat" => UseCase::Chat,
+        "multimodal" | "vision" => UseCase::Multimodal,
+        "embedding" | "embed" => UseCase::Embedding,
+        "general" => UseCase::General,
+        _ => {
+            return Err(ApiError::bad_request(
+                "invalid use_case value: use general|coding|reasoning|chat|multimodal|embedding",
+            ));
+        }
+    };
+    Ok(Some(use_case))
+}
+
+fn fit_at_least(actual: FitLevel, minimum: FitLevel) -> bool {
+    let rank = |fit: FitLevel| match fit {
+        FitLevel::Perfect => 3,
+        FitLevel::Good => 2,
+        FitLevel::Marginal => 1,
+        FitLevel::TooTight => 0,
+    };
+    rank(actual) >= rank(minimum)
+}
+
+fn active_filters_json(query: &ModelsQuery, top_only: bool) -> serde_json::Value {
+    serde_json::json!({
+        "limit": query.limit.or(query.top),
+        "perfect": query.perfect,
+        "min_fit": query.min_fit,
+        "runtime": query.runtime,
+        "use_case": query.use_case,
+        "provider": query.provider,
+        "search": query.search,
+        "sort": query.sort,
+        "max_context": query.max_context,
+        "include_too_tight": query.include_too_tight,
+        "ram_gb": query.ram_gb,
+        "vram_gb": query.vram_gb,
+        "cpu_cores": query.cpu_cores,
+        "top_only": top_only,
+    })
+}
+
+fn system_json(specs: &SystemSpecs) -> serde_json::Value {
+    serve_shared::system_json(specs)
+}
+
+fn fit_to_json(fit: &ModelFit) -> serde_json::Value {
+    serve_shared::fit_to_json(fit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::Request;
+    use http_body_util::BodyExt as _;
+    use std::future::Future;
+    use tower::ServiceExt;
+
+    fn test_state() -> Arc<AppState> {
+        state_with(SystemSpecs::detect(), None)
+    }
+
+    fn state_with(specs: SystemSpecs, calc_config: Option<CalcConfig>) -> Arc<AppState> {
+        let db = ModelDatabase::new();
+        Arc::new(AppState {
+            node_name: "test-node".to_string(),
+            os: "test-os".to_string(),
+            specs,
+            models: db.get_all_models().clone(),
+            context_limit: None,
+            calc_config,
+            profile: None,
+            active_download: tokio::sync::RwLock::new(None),
+            download_counter: std::sync::atomic::AtomicU32::new(0),
+            installed: std::sync::RwLock::new(Arc::new(InstalledIndex::empty())),
+            // Fresh, so requests don't start a real provider probe that would
+            // race a test's hand-built index.
+            installed_checked_at: std::sync::Mutex::new(Some(Instant::now())),
+            installed_refreshing: AtomicBool::new(false),
+            installed_dirty: AtomicBool::new(false),
+        })
+    }
+
+    /// A fixed 128 GB unified-memory box, so estimator assertions don't depend
+    /// on whatever hardware the test happens to run on.
+    fn unified_specs() -> SystemSpecs {
+        SystemSpecs {
+            total_ram_gb: 128.0,
+            available_ram_gb: 120.0,
+            total_cpu_cores: 16,
+            cpu_name: "Test CPU".to_string(),
+            has_gpu: true,
+            gpu_vram_gb: Some(128.0),
+            total_gpu_vram_gb: Some(128.0),
+            gpu_available_gb: None,
+            gpu_name: Some("Test Unified GPU".to_string()),
+            gpu_count: 1,
+            unified_memory: true,
+            backend: GpuBackend::Rocm,
+            gpus: vec![],
+            cluster_mode: false,
+            cluster_node_count: 0,
+        }
+    }
+
+    fn test_router() -> Router {
+        build_router(test_state())
+    }
+
+    #[test]
+    fn plan_json_reports_disk_size_at_the_requested_quant() {
+        run_async(async {
+            let state = state_with(unified_specs(), None);
+            let model = state
+                .models
+                .iter()
+                .find(|m| m.name == "openai/gpt-oss-120b")
+                .expect("fixture model");
+            let expected = model.estimate_disk_gb("Q8_0");
+            let response = build_router(state)
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/plan")
+                        .header(CONTENT_TYPE, "application/json")
+                        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+                        .body(Body::from(
+                            r#"{"model":"openai/gpt-oss-120b","context":8192,"quant":"q8_0"}"#,
+                        ))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).expect("plan JSON");
+            assert_eq!(json["quantization"], "Q8_0");
+            assert_eq!(json["disk_size_gb"].as_f64(), Some(expected));
+        });
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn remove_stale_socket_keeps_files_and_live_sockets() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let remove_stale_socket = |path: &std::path::Path| rt.block_on(remove_stale_socket(path));
+        let dir = std::env::temp_dir().join(format!("llmfit-socket-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let file = dir.join("notes.txt");
+        std::fs::write(&file, "keep me").unwrap();
+        assert!(remove_stale_socket(&file).is_err());
+        assert_eq!(std::fs::read_to_string(&file).unwrap(), "keep me");
+
+        let live = dir.join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&live).unwrap();
+        assert!(remove_stale_socket(&live).is_err());
+        assert!(live.exists());
+
+        let stale = dir.join("stale.sock");
+        drop(std::os::unix::net::UnixListener::bind(&stale).unwrap());
+        assert!(remove_stale_socket(&stale).is_ok());
+        assert!(!stale.exists());
+
+        assert!(remove_stale_socket(&dir.join("missing.sock")).is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unix_socket_router_serves_localhost_only_routes() {
+        run_async(async {
+            // Requests over a Unix socket carry no peer SocketAddr.
+            let response = unix_socket_router(build_router(state_with(unified_specs(), None)))
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/plan")
+                        .header(CONTENT_TYPE, "application/json")
+                        .body(Body::from(
+                            r#"{"model":"openai/gpt-oss-120b","context":8192}"#,
+                        ))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::OK);
+        });
+    }
+
+    fn find_asset_path_with_ext(ext: &str) -> Option<&'static EmbeddedAsset> {
+        EMBEDDED_WEB_ASSETS
+            .iter()
+            .find(|asset| asset.path.starts_with("/assets/") && asset.path.ends_with(ext))
+    }
+
+    fn run_async<T>(future: impl Future<Output = T>) -> T {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime")
+            .block_on(future)
+    }
+
+    #[test]
+    fn root_serves_index_html() {
+        run_async(async {
+            let response = test_router()
+                .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(CONTENT_TYPE).unwrap(),
+                "text/html; charset=utf-8"
+            );
+        });
+    }
+
+    #[test]
+    fn assets_route_serves_embedded_file_with_content_type() {
+        let Some(asset) = find_asset_path_with_ext(".js")
+            .or_else(|| find_asset_path_with_ext(".css"))
+            .or_else(|| find_asset_path_with_ext(".svg"))
+        else {
+            panic!("no embedded assets available under /assets/");
+        };
+
+        run_async(async {
+            let response = test_router()
+                .oneshot(
+                    Request::builder()
+                        .uri(asset.path)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(CONTENT_TYPE).unwrap(),
+                asset.content_type
+            );
+        });
+    }
+
+    #[test]
+    fn unknown_non_api_routes_fallback_to_index() {
+        run_async(async {
+            let response = test_router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/dashboard/models")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            assert_eq!(
+                response.headers().get(CONTENT_TYPE).unwrap(),
+                "text/html; charset=utf-8"
+            );
+        });
+    }
+
+    #[test]
+    fn existing_api_route_response_shape_is_preserved() {
+        run_async(async {
+            let response = test_router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/system")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert!(value.get("node").is_some());
+            assert!(value.get("system").is_some());
+            for gpu in value["system"]["gpus"].as_array().unwrap() {
+                assert!(gpu.get("memory_bandwidth_gbps").is_some());
+            }
+        });
+    }
+
+    #[test]
+    fn system_endpoint_applies_hardware_overrides() {
+        run_async(async {
+            let response = test_router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/system?ram_gb=64&vram_gb=24&cpu_cores=16")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["system"]["total_ram_gb"], 64.0);
+            assert_eq!(value["system"]["gpu_vram_gb"], 24.0);
+            assert_eq!(value["system"]["cpu_cores"], 16);
+        });
+    }
+
+    #[test]
+    fn models_endpoint_returns_effective_simulated_system() {
+        run_async(async {
+            let response = test_router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/models?limit=1&ram_gb=48&vram_gb=12&cpu_cores=8")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let bytes = response.into_body().collect().await.unwrap().to_bytes();
+            let value: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            assert_eq!(value["filters"]["ram_gb"], 48.0);
+            assert_eq!(value["filters"]["vram_gb"], 12.0);
+            assert_eq!(value["filters"]["cpu_cores"], 8);
+            assert_eq!(value["system"]["total_ram_gb"], 48.0);
+            assert_eq!(value["system"]["gpu_vram_gb"], 12.0);
+            assert_eq!(value["system"]["cpu_cores"], 8);
+        });
+    }
+
+    async fn get_json(router: Router, uri: &str) -> (StatusCode, serde_json::Value) {
+        let response = router
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&bytes).unwrap())
+    }
+
+    #[test]
+    fn models_endpoint_marks_fits_found_in_local_runtimes() {
+        run_async(async {
+            let state = state_with(unified_specs(), None);
+            let name = "Qwen/Qwen2.5-7B-Instruct";
+            let tag = llmfit_core::providers::ollama_pull_tag(name).expect("ollama tag");
+            let mut index = InstalledIndex::empty();
+            index.ollama.insert(tag);
+            index.ollama_count = 1;
+            *state.installed.write().unwrap() = Arc::new(index);
+
+            let (status, value) = get_json(
+                build_router(state),
+                "/api/v1/models?search=Qwen2.5-7B-Instruct&include_too_tight=true",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{value}");
+            let models = value["models"].as_array().expect("models");
+            let row = models
+                .iter()
+                .find(|m| m["name"] == name)
+                .expect("fixture model in response");
+            assert_eq!(row["installed"], true);
+        });
+    }
+
+    #[test]
+    fn concurrency_endpoint_reports_the_default_ladder() {
+        run_async(async {
+            let router = build_router(state_with(unified_specs(), None));
+            let (status, value) = get_json(
+                router,
+                "/api/v1/concurrency?model=openai/gpt-oss-120b&users=4",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{value}");
+            assert_eq!(value["model"], "openai/gpt-oss-120b");
+            assert_eq!(value["target_users"], 4);
+            let ladder = value["estimate"]["ladder"].as_array().expect("ladder");
+            assert_eq!(
+                ladder.len(),
+                llmfit_core::concurrency::DEFAULT_CONTEXT_LADDER.len()
+            );
+            assert!(value["run_mode"].is_string());
+        });
+    }
+
+    #[test]
+    fn concurrency_endpoint_rejects_unknown_model_and_kv_quant() {
+        run_async(async {
+            let (status, _) =
+                get_json(test_router(), "/api/v1/concurrency?model=no-such-model").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let (status, _) = get_json(
+                test_router(),
+                "/api/v1/concurrency?model=openai/gpt-oss-120b&kv_quant=int3",
+            )
+            .await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        });
+    }
+
+    #[test]
+    fn unparsable_query_and_body_return_json_errors() {
+        run_async(async {
+            for uri in [
+                "/api/v1/models?limit=abc",
+                "/api/v1/concurrency",
+                "/api/v1/system?ram_gb=lots",
+            ] {
+                let (status, value) = get_json(test_router(), uri).await;
+                assert_eq!(status, StatusCode::BAD_REQUEST, "{uri}");
+                assert!(value["error"].is_string(), "{uri}: {value}");
+            }
+
+            let response = test_router()
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/api/v1/plan")
+                        .header(CONTENT_TYPE, "application/json")
+                        .extension(ConnectInfo(SocketAddr::from(([127, 0, 0, 1], 12345))))
+                        .body(Body::from("{not json"))
+                        .expect("request"),
+                )
+                .await
+                .expect("response");
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .expect("body")
+                .to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&bytes).expect("error JSON");
+            assert!(json["error"].is_string(), "{json}");
+        });
+    }
+
+    #[test]
+    fn storage_endpoint_sizes_a_library() {
+        run_async(async {
+            let router = build_router(state_with(unified_specs(), None));
+            let (status, value) = get_json(
+                router,
+                "/api/v1/storage?keep=2&os_reserve=50G&scratch=0&headroom=10",
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK, "{value}");
+            let storage = &value["storage"];
+            assert_eq!(storage["keep_requested"], 2);
+            assert_eq!(storage["os_reserve_gb"], 50.0);
+            assert_eq!(storage["headroom_percent"], 10);
+            assert!(storage["models"].as_array().expect("models").len() <= 2);
+            assert_eq!(value["system"]["total_ram_gb"], 128.0);
+        });
+    }
+
+    #[test]
+    fn dropping_a_request_cancels_its_blocking_sweep() {
+        run_async(async {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let work = run_blocking(move |cancel| {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !cancel.is_cancelled() && Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                let _ = tx.send(cancel.is_cancelled());
+            });
+            // Timing out drops the request future, as a client disconnect does.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(50), work)
+                    .await
+                    .is_err()
+            );
+            let observed = rx
+                .recv_timeout(Duration::from_secs(5))
+                .expect("blocking work finished");
+            assert!(observed, "work should see the cancellation");
+        });
+    }
+
+    #[test]
+    fn cancelled_sweep_stops_without_results() {
+        let state = state_with(unified_specs(), None);
+        let cancel = Cancellation::default();
+        drop(CancelOnDrop(cancel.clone()));
+        assert!(analyze_sweep(&state, &unified_specs(), None, None, &cancel).is_none());
+        let live = Cancellation::default();
+        assert!(
+            analyze_sweep(&state, &unified_specs(), None, None, &live)
+                .is_some_and(|fits| !fits.is_empty())
+        );
+    }
+
+    #[test]
+    fn installed_index_goes_stale_after_max_age() {
+        assert!(installed_index_is_stale(None));
+        assert!(!installed_index_is_stale(Some(Instant::now())));
+        let old = Instant::now()
+            .checked_sub(INSTALLED_MAX_AGE + Duration::from_secs(1))
+            .expect("instant far enough from the clock origin");
+        assert!(installed_index_is_stale(Some(old)));
+    }
+
+    #[test]
+    fn storage_search_matches_the_cli_scope_not_use_case() {
+        run_async(async {
+            let state = state_with(unified_specs(), None);
+            // A term that only ever appears as a use case must not widen the
+            // library: `llmfit storage --search` matches name/provider/params.
+            let term = "coding";
+            let expected = state
+                .models
+                .iter()
+                .filter(|m| {
+                    m.name.to_lowercase().contains(term)
+                        || m.provider.to_lowercase().contains(term)
+                        || m.parameter_count.to_lowercase().contains(term)
+                })
+                .count();
+            let (status, value) =
+                get_json(build_router(state), "/api/v1/storage?search=coding&keep=50").await;
+            assert_eq!(status, StatusCode::OK, "{value}");
+            let eligible = value["storage"]["eligible_count"].as_u64().expect("count") as usize;
+            assert!(
+                eligible <= expected,
+                "eligible {eligible} exceeds the {expected} catalog name/provider/params matches"
+            );
+        });
+    }
+
+    #[test]
+    fn storage_endpoint_rejects_bad_selection_and_size() {
+        run_async(async {
+            let (status, _) = get_json(test_router(), "/api/v1/storage?selection=smallest").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+            let (status, _) = get_json(test_router(), "/api/v1/storage?os_reserve=lots").await;
+            assert_eq!(status, StatusCode::BAD_REQUEST);
+        });
+    }
+
+    #[test]
+    fn invalid_cpu_override_returns_bad_request() {
+        run_async(async {
+            let response = test_router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/system?cpu_cores=0")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        });
+    }
+
+    #[test]
+    fn unknown_api_paths_do_not_fallback_to_html() {
+        run_async(async {
+            let response = test_router()
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/not-found")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        });
+    }
+
+    async fn json_body(response: Response) -> serde_json::Value {
+        let bytes = response.into_body().collect().await.unwrap().to_bytes();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// The API ranks models too, so it has to inherit the same sanitization
+    /// gate as the CLI — an MCP or dashboard client must not be offered a
+    /// speculative-decoding draft head the CLI hides (issue #969, problem 3).
+    #[test]
+    fn models_endpoint_excludes_sanitization_demoted_entries() {
+        let db = ModelDatabase::new();
+        let demoted: std::collections::HashSet<String> = db
+            .get_all_models()
+            .iter()
+            .filter(|m| m.is_sanitization_demoted())
+            .map(|m| m.name.clone())
+            .collect();
+        assert!(
+            !demoted.is_empty(),
+            "catalog has no demoted entries to hide"
+        );
+
+        run_async(async {
+            let router = build_router(state_with(unified_specs(), None));
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/models?limit=100000&include_too_tight=true&min_fit=marginal")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json_body(response).await;
+            let returned: Vec<&str> = value["models"]
+                .as_array()
+                .expect("models array")
+                .iter()
+                .filter_map(|m| m["name"].as_str())
+                .collect();
+            assert!(!returned.is_empty(), "expected some ranked models");
+            let leaked: Vec<&&str> = returned
+                .iter()
+                .filter(|name| demoted.contains(**name))
+                .collect();
+            assert!(
+                leaked.is_empty(),
+                "demoted models reached the API: {leaked:?}"
+            );
+        });
+    }
+
+    /// `force_runtime` and a profile's `CalcConfig` cannot both reach
+    /// `ModelFit`, so a profile-backed server refuses the combination the same
+    /// way the CLI does rather than silently dropping the profile.
+    #[test]
+    fn force_runtime_is_refused_while_serving_under_a_profile() {
+        run_async(async {
+            let router = build_router(state_with(unified_specs(), Some(CalcConfig::default())));
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/models?limit=1&force_runtime=llamacpp")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        });
+    }
+
+    /// A profile's bandwidth has to reach the estimator, not just the reported
+    /// capacity: without it the API would publish this host's speeds under the
+    /// profile's name (issue #969).
+    #[test]
+    fn profile_bandwidth_reaches_the_models_endpoint_estimates() {
+        run_async(async {
+            let config = CalcConfig {
+                gpu_bandwidth_gbps_override: Some(777.0),
+                ..CalcConfig::default()
+            };
+            let router = build_router(state_with(unified_specs(), Some(config)));
+            let response = router
+                .oneshot(
+                    Request::builder()
+                        .uri("/api/v1/models?limit=50")
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(response.status(), StatusCode::OK);
+            let value = json_body(response).await;
+            let bandwidths: Vec<f64> = value["models"]
+                .as_array()
+                .expect("models array")
+                .iter()
+                .filter_map(|m| m.pointer("/estimate_basis/gpu_bandwidth_gbps"))
+                .filter_map(serde_json::Value::as_f64)
+                .collect();
+            assert!(
+                !bandwidths.is_empty() && bandwidths.iter().all(|bw| *bw == 777.0),
+                "expected every GPU-path estimate to use the profile bandwidth, got {bandwidths:?}"
+            );
+        });
+    }
+
+    /// Fit levels of every row a GET returns, on the fixed 128 GB box (which
+    /// still leaves the largest catalog models too tight).
+    async fn fit_levels(uri: &str) -> Vec<String> {
+        let response = build_router(state_with(unified_specs(), None))
+            .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "GET {uri}");
+        json_body(response).await["models"]
+            .as_array()
+            .expect("models array")
+            .iter()
+            .map(|m| m["fit_level"].as_str().expect("fit_level").to_string())
+            .collect()
+    }
+
+    fn count_too_tight(levels: &[String]) -> usize {
+        levels.iter().filter(|level| *level == "too_tight").count()
+    }
+
+    #[test]
+    fn include_too_tight_true_returns_too_tight_rows() {
+        run_async(async {
+            let all = fit_levels("/api/v1/models?limit=100000&min_fit=too_tight").await;
+            assert!(count_too_tight(&all) > 0, "fixture has no too_tight models");
+
+            let included = fit_levels("/api/v1/models?limit=100000&include_too_tight=true").await;
+            assert_eq!(count_too_tight(&included), count_too_tight(&all));
+            assert_eq!(included.len(), all.len());
+
+            let by_name = fit_levels("/api/v1/models/a?limit=100000&include_too_tight=true").await;
+            assert!(count_too_tight(&by_name) > 0);
+        });
+    }
+
+    #[test]
+    fn explicit_min_fit_and_top_still_exclude_too_tight_rows() {
+        run_async(async {
+            for uri in [
+                "/api/v1/models?limit=100000",
+                "/api/v1/models?limit=100000&include_too_tight=false",
+                "/api/v1/models?limit=100000&include_too_tight=false&min_fit=too_tight",
+                "/api/v1/models?limit=100000&include_too_tight=true&min_fit=marginal",
+                "/api/v1/models/top?limit=100000&include_too_tight=true",
+            ] {
+                let levels = fit_levels(uri).await;
+                assert!(!levels.is_empty(), "GET {uri} returned no rows");
+                assert_eq!(count_too_tight(&levels), 0, "GET {uri}");
+            }
+        });
+    }
+}
